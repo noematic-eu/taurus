@@ -1,0 +1,14 @@
+{
+  "name": "taurus",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "audit": "npm audit --audit-level=moderate && cargo deny --manifest-path src-tauri/Cargo.toml check && cargo audit --file src-tauri/Cargo.lock"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Taurus</title>
+    <link rel="icon" href="assets/icon.png" />
+    <script type="module" src="main.js" defer></script>
+  </head>
+  <body>
+    <main class="wrap">
+      <img class="mark" src="assets/icon.png" width="72" height="72" alt="" />
+      <p class="kicker">Lecteur de packs</p>
+      <h1>Taurus</h1>
+      <p class="lede">
+        Glisse un zip de cours (SysML, POO, Native…). Le contenu n’est pas dans
+        l’appli&nbsp;: chaque zip est un site.
+      </p>
+
+      <button type="button" id="pick" class="drop">
+        <span class="drop-title">Déposer un .zip ici</span>
+        <span class="drop-hint">ou cliquer pour parcourir</span>
+      </button>
+
+      <p id="status" class="status" hidden></p>
+    </main>
+  </body>
+</html>
