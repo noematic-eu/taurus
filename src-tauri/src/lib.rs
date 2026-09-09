@@ -119,14 +119,19 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("erreur Taurus")
-        .run(|handle, event| {
-            // Double-clic ou drop sur l’icône (dock/Finder) — macOS.
-            if let tauri::RunEvent::Opened { urls } = event {
-                let paths: Vec<PathBuf> = urls
-                    .iter()
-                    .filter_map(|u| u.to_file_path().ok())
-                    .collect();
-                drop_packs(handle, &paths);
-            }
-        });
+        .run(
+            #[allow(unused_variables)]
+            |handle, event| {
+                // Double-clic / drop sur l’icône : macOS seulement (RunEvent::Opened).
+                // Linux/Windows : le fichier arrive en argument CLI (setup ci-dessus).
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                if let tauri::RunEvent::Opened { urls } = event {
+                    let paths: Vec<PathBuf> = urls
+                        .iter()
+                        .filter_map(|u| u.to_file_path().ok())
+                        .collect();
+                    drop_packs(handle, &paths);
+                }
+            },
+        );
 }
