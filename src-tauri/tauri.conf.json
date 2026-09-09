@@ -29,6 +29,25 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["zip"],
+        "name": "Zip website pack",
+        "mimeType": "application/zip",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["wacz"],
+        "name": "WACZ web archive",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["warc", "warc.gz"],
+        "name": "WARC web archive",
+        "mimeType": "application/warc",
+        "role": "Viewer"
+      }
     ]
   }
 }

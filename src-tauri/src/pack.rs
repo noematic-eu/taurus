@@ -20,15 +20,21 @@ pub struct PackServer {
 }
 
 impl PackServer {
-    pub fn open(zip_path: &Path) -> Result<Self, String> {
-        let title = zip_path
+    pub fn open(pack_path: &Path) -> Result<Self, String> {
+        let title = pack_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "pack".into());
 
         let dir = tempfile::tempdir().map_err(|e| format!("temp: {e}"))?;
-        unzip(zip_path, dir.path())?;
-        let (root, entry) = site_root(dir.path())?;
+        let pack_path = resolve_input(pack_path)?;
+        let (root, entry) = if is_web_archive(&pack_path) {
+            let site = crate::wacz::materialize(&pack_path, dir.path())?;
+            site_root(&site)?
+        } else {
+            unzip(&pack_path, dir.path())?;
+            site_root(dir.path())?
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind: {e}"))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -61,7 +67,111 @@ impl PackServer {
     }
 }
 
-fn unzip(zip_path: &Path, dest: &Path) -> Result<(), String> {
+pub(crate) fn is_web_archive(p: &Path) -> bool {
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name.ends_with(".wacz") || name.ends_with(".warc") || name.ends_with(".warc.gz")
+}
+
+/// Si `path` est un dossier de collection Browsertrix, pointe vers le `.wacz` (ou WARC) dedans.
+pub(crate) fn resolve_input(path: &Path) -> Result<PathBuf, String> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if path.is_dir() {
+        return find_archive_in_dir(path)
+            .ok_or_else(|| "Pas de .wacz / .warc / .zip dans le dossier.".into());
+    }
+    Err(format!("{} introuvable.", path.display()))
+}
+
+pub(crate) fn find_archive_in_dir(dir: &Path) -> Option<PathBuf> {
+    if let Some(name) = dir.file_name() {
+        let named = dir.join(format!("{}.wacz", name.to_string_lossy()));
+        if named.is_file() {
+            return Some(named);
+        }
+    }
+
+    let mut wacz = Vec::new();
+    let mut warc = Vec::new();
+    let mut zip = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if !p.is_file() {
+                continue;
+            }
+            let n = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if n.ends_with(".wacz") {
+                wacz.push(p);
+            } else if n.ends_with(".warc.gz") || n.ends_with(".warc") {
+                warc.push(p);
+            } else if n.ends_with(".zip") {
+                zip.push(p);
+            }
+        }
+    }
+    wacz.sort();
+    if let Some(p) = wacz.into_iter().next() {
+        return Some(p);
+    }
+
+    let archive = dir.join("archive");
+    if archive.is_dir() {
+        let mut recs = Vec::new();
+        if let Ok(rd) = fs::read_dir(&archive) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                let n = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if n.ends_with(".warc.gz") || n.ends_with(".warc") {
+                    recs.push(p);
+                }
+            }
+        }
+        recs.sort();
+        if let Some(p) = recs.into_iter().next() {
+            return Some(p);
+        }
+    }
+
+    warc.sort();
+    if let Some(p) = warc.into_iter().next() {
+        return Some(p);
+    }
+    zip.sort();
+    zip.into_iter().next()
+}
+
+fn resolve_served_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel = rel.trim_start_matches('/').trim_end_matches('/');
+    let joined = if rel.is_empty() {
+        root.join("index.html")
+    } else {
+        root.join(rel)
+    };
+    if joined.is_file() {
+        return Some(joined);
+    }
+    let index = joined.join("index.html");
+    if index.is_file() {
+        return Some(index);
+    }
+    None
+}
+
+pub(crate) fn unzip(zip_path: &Path, dest: &Path) -> Result<(), String> {
     let file = File::open(zip_path).map_err(|e| format!("zip introuvable: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("zip illisible: {e}"))?;
     archive
@@ -137,13 +247,11 @@ fn serve(server: Server, root: PathBuf, stop: Arc<AtomicBool>) {
 
         let url_path = req.url().split('?').next().unwrap_or("/");
         let rel = url_path.trim_start_matches('/');
-        let rel = if rel.is_empty() {
-            "index.html".to_string()
-        } else {
-            rel.to_string()
+        let Some(joined) = resolve_served_path(&root, rel) else {
+            let _ =
+                req.respond(Response::from_string("introuvable").with_status_code(StatusCode(404)));
+            continue;
         };
-
-        let joined = root.join(&rel);
         let Ok(canon) = joined.canonicalize() else {
             let _ =
                 req.respond(Response::from_string("introuvable").with_status_code(StatusCode(404)));
@@ -180,5 +288,37 @@ fn serve(server: Server, root: PathBuf, stop: Arc<AtomicBool>) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serves_directory_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let blog = dir.path().join("blog");
+        std::fs::create_dir(&blog).unwrap();
+        std::fs::write(dir.path().join("index.html"), b"home").unwrap();
+        std::fs::write(blog.join("index.html"), b"blog").unwrap();
+
+        let home = resolve_served_path(dir.path(), "").unwrap();
+        assert_eq!(std::fs::read_to_string(home).unwrap(), "home");
+        let slash = resolve_served_path(dir.path(), "blog/").unwrap();
+        assert_eq!(std::fs::read_to_string(slash).unwrap(), "blog");
+        let noslash = resolve_served_path(dir.path(), "blog").unwrap();
+        assert_eq!(std::fs::read_to_string(noslash).unwrap(), "blog");
+    }
+
+    #[test]
+    fn finds_wacz_in_collection_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let col = dir.path().join("example");
+        std::fs::create_dir(&col).unwrap();
+        let wacz = col.join("example.wacz");
+        std::fs::write(&wacz, b"pk").unwrap();
+        assert_eq!(find_archive_in_dir(&col).as_deref(), Some(wacz.as_path()));
+        assert_eq!(resolve_input(&col).unwrap(), wacz);
     }
 }

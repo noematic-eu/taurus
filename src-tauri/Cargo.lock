@@ -3611,6 +3611,7 @@ dependencies = [
 name = "taurus"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "mime_guess",
  "serde",
  "serde_json",

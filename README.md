@@ -5,8 +5,8 @@
 </p>
 
 <p align="center">
-  <strong>A desktop player for zipped static websites.</strong><br />
-  The zip changes; the app does not.
+  <strong>A desktop player for zipped static websites and WACZ web archives.</strong><br />
+  The archive changes; the app does not.
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/version-0.1.0-1e3a4c.svg" alt="Version 0.1.0" />
 </p>
 
-Taurus opens a `.zip` that contains a static site (`OUVRIR.html` or `index.html`) in its own window. Course packs, lab materials, offline docs — the content lives in the zip, not in the binary.
+Taurus opens a `.zip` (static site: `OUVRIR.html` or `index.html`) or a `.wacz` web archive in its own window. Course packs, Manning liveBooks, lab materials — the content lives in the archive, not in the binary.
 
 Built with [Tauri 2](https://tauri.app/). The name is a pun on the framework; Taurus is the app, not Tauri.
 
@@ -27,9 +27,9 @@ Built with [Tauri 2](https://tauri.app/). The name is a pun on the framework; Ta
 
 ### What it does
 
-Drop a zip, pick one from the file dialog, or pass a path on the command line. Taurus:
+Drop a zip or WACZ, pick one from the file dialog, pass a path on the command line, or double-click / drop it on the app icon (bundled app, via macOS file associations). Taurus:
 
-1. Extracts the archive to a temporary folder
+1. Extracts the archive to a temporary folder (WACZ: WARC records become HTML + `figures/`)
 2. Finds the entry page (`OUVRIR.html`, `ouvrir.html`, `index.html`, or `index.htm`)
 3. Serves the files over HTTP on `127.0.0.1`
 4. Opens a dedicated window on that local URL
@@ -39,7 +39,7 @@ Several packs can be open at once. Updating a course means shipping a new zip, n
 
 ### Pack format
 
-A pack is a zip of a static website.
+A pack is a zip of a static website, or a [WACZ](https://specs.webrecorder.net/wacz/latest/) (ISO WARC inside a zip). CloudFront figure URLs in Manning liveBooks are rewritten to local `figures/` files so the book works offline.
 
 ```text
 course.zip
@@ -87,10 +87,11 @@ npm install
 npm run tauri dev
 ```
 
-Pass zip paths as arguments to open them on launch:
+Pass zip or WACZ paths as arguments to open them on launch:
 
 ```bash
 npm run tauri dev -- -- /path/to/pack.zip
+npm run tauri dev -- -- ~/kb/html/manning/_archives/a-simple-guide-to-retrieval-augmented-generation/a-simple-guide-to-retrieval-augmented-generation.wacz
 ```
 
 ### Build
@@ -143,9 +144,9 @@ Current lockfiles have **no known vulnerabilities**. Documented exceptions in `d
 
 ### À quoi ça sert
 
-Glissez un zip, choisissez-le dans le dialogue, ou passez un chemin en ligne de commande. Taurus :
+Glissez un zip ou un `.wacz`, choisissez-le dans le dialogue, passez un chemin en ligne de commande, ou double-cliquez / déposez-le sur l’icône de l’app (app packagée, associations de fichiers macOS). Taurus :
 
-1. extrait l’archive dans un dossier temporaire ;
+1. extrait l’archive dans un dossier temporaire (WACZ : enregistrements WARC → HTML + `figures/`) ;
 2. trouve la page d’entrée (`OUVRIR.html`, `ouvrir.html`, `index.html` ou `index.htm`) ;
 3. sert les fichiers en HTTP sur `127.0.0.1` ;
 4. ouvre une fenêtre dédiée sur cette URL locale ;
@@ -155,7 +156,7 @@ Plusieurs packs peuvent être ouverts en même temps. Mettre à jour un cours, c
 
 ### Format d’un pack
 
-Un pack est un zip contenant un site statique.
+Un pack est un zip de site statique, ou une archive [WACZ](https://specs.webrecorder.net/wacz/latest/) (WARC ISO dans un zip). Les URL CloudFront des figures Manning sont réécrits vers `figures/` pour la lecture hors-ligne.
 
 ```text
 cours.zip
@@ -203,10 +204,11 @@ npm install
 npm run tauri dev
 ```
 
-Passez des chemins de zip en arguments pour les ouvrir au lancement :
+Passez des chemins de zip ou de WACZ en arguments pour les ouvrir au lancement :
 
 ```bash
 npm run tauri dev -- -- /chemin/vers/pack.zip
+npm run tauri dev -- -- ~/kb/html/manning/_archives/a-simple-guide-to-retrieval-augmented-generation/a-simple-guide-to-retrieval-augmented-generation.wacz
 ```
 
 ### Compilation
