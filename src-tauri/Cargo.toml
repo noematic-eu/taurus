@@ -1,6 +1,6 @@
 [package]
 name = "taurus"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Baptiste Boussemart"]
 description = "Lecteur de packs web (zip, wacz) — SysML, POO, Native, Manning…"
 license = "MIT"

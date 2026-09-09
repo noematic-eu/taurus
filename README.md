@@ -14,7 +14,7 @@
   &nbsp;·&nbsp;
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license" /></a>
   <img src="https://img.shields.io/badge/tauri-2-24c8db.svg" alt="Tauri 2" />
-  <img src="https://img.shields.io/badge/version-0.1.0-1e3a4c.svg" alt="Version 0.1.0" />
+  <img src="https://img.shields.io/badge/version-0.2.0-1e3a4c.svg" alt="Version 0.2.0" />
 </p>
 
 Taurus opens a `.zip` (static site: `OUVRIR.html` or `index.html`) or a `.wacz` web archive in its own window. Course packs, Manning liveBooks, lab materials — the content lives in the archive, not in the binary.
