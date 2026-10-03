@@ -1,3 +1,4 @@
+mod md;
 mod pack;
 mod wacz;
 
@@ -12,11 +13,6 @@ use tauri_plugin_dialog::DialogExt;
 static PACK_ID: AtomicU64 = AtomicU64::new(1);
 
 fn open_pack(app: &tauri::AppHandle, pack_path: PathBuf) -> Result<String, String> {
-    let pack_path = pack::resolve_input(&pack_path)?;
-    if !is_pack_file(&pack_path) {
-        return Err("Fichier .zip, .wacz ou .warc attendu.".into());
-    }
-
     let server = PackServer::open(&pack_path)?;
     let url = server.url();
     let title = format!("Taurus — {}", server.title);
@@ -58,6 +54,22 @@ fn pick_pack(app: tauri::AppHandle) {
 }
 
 #[tauri::command]
+fn pick_folder(app: tauri::AppHandle) {
+    app.dialog()
+        .file()
+        .set_title("Ouvrir un dossier de site")
+        .pick_folder(move |folder| {
+            let Some(path) = folder else {
+                return;
+            };
+            let path = PathBuf::from(path.to_string());
+            if let Err(e) = open_pack(&app, path) {
+                let _ = app.emit("taurus-error", e);
+            }
+        });
+}
+
+#[tauri::command]
 fn open_pack_path(app: tauri::AppHandle, path: String) -> Result<String, String> {
     open_pack(&app, PathBuf::from(path))
 }
@@ -71,31 +83,28 @@ fn drop_packs(app: &tauri::AppHandle, paths: &[PathBuf]) {
         } else {
             let _ = app.emit(
                 "taurus-error",
-                format!("{} n’est pas un .zip / .wacz / .warc", p.display()),
+                format!(
+                    "{} n’est pas un dossier de site, un .zip, un .wacz ni un .warc",
+                    p.display()
+                ),
             );
         }
     }
 }
 
 fn is_pack(p: &Path) -> bool {
-    if p.is_dir() {
-        return pack::find_archive_in_dir(p).is_some();
-    }
-    is_pack_file(p)
-}
-
-fn is_pack_file(p: &Path) -> bool {
-    pack::is_web_archive(p)
-        || p.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+    pack::is_openable(p)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![pick_pack, open_pack_path])
+        .invoke_handler(tauri::generate_handler![
+            pick_pack,
+            pick_folder,
+            open_pack_path
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
             if let Some(main) = app.get_webview_window("main") {
@@ -126,10 +135,8 @@ pub fn run() {
                 // Linux/Windows : le fichier arrive en argument CLI (setup ci-dessus).
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
                 if let tauri::RunEvent::Opened { urls } = event {
-                    let paths: Vec<PathBuf> = urls
-                        .iter()
-                        .filter_map(|u| u.to_file_path().ok())
-                        .collect();
+                    let paths: Vec<PathBuf> =
+                        urls.iter().filter_map(|u| u.to_file_path().ok()).collect();
                     drop_packs(handle, &paths);
                 }
             },

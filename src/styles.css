@@ -90,6 +90,24 @@ h1 {
   color: var(--muted);
 }
 
+.alt {
+  display: block;
+  width: 100%;
+  margin-top: 0.75rem;
+  padding: 0.4rem 1rem;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  font-size: 0.95rem;
+  color: var(--teal);
+  cursor: pointer;
+  text-align: center;
+}
+
+.alt:hover {
+  text-decoration: underline;
+}
+
 .status {
   margin-top: 1.25rem;
   font-size: 0.95rem;

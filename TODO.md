@@ -6,7 +6,7 @@
 - [x] Association de fichiers macOS (double-clic `.zip` / `.wacz` → Taurus)
 - [x] Glisser-déposer un pack sur l'icône de l'app (dock)
 - [ ] Rouvrir le dernier pack au lancement
-- [ ] Ouvrir un dossier en plus d'une archive (dev de cours sans rezipper)
+- [x] Ouvrir un dossier en plus d'une archive (dev de cours sans rezipper)
 
 ## Confort de lecture
 
@@ -14,7 +14,7 @@
 - [ ] Menu Préférences
 - [ ] Menu de navigation (historique, retour avant/arrière…)
 - [ ] Reprendre la lecture là où on en était (dernière URL par pack)
-- [ ] Rendu Markdown (si packs écrits en `.md`)
+- [x] Rendu Markdown (si packs écrits en `.md`)
 
 ## Recherche
 

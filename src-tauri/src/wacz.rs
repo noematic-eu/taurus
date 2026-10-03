@@ -117,7 +117,9 @@ fn read_records<R: BufRead>(
         }
 
         let mut body = vec![0u8; len];
-        reader.read_exact(&mut body).map_err(|e| format!("corps WARC: {e}"))?;
+        reader
+            .read_exact(&mut body)
+            .map_err(|e| format!("corps WARC: {e}"))?;
         // Skip the CRLF(s) that terminate the WARC record.
         loop {
             let avail = reader.fill_buf().map_err(|e| e.to_string())?;
@@ -144,7 +146,10 @@ fn read_records<R: BufRead>(
         }
 
         let (payload, as_html) = if warc_type == "resource" {
-            let ctype = headers.get("content-type").map(|s| s.as_str()).unwrap_or("");
+            let ctype = headers
+                .get("content-type")
+                .map(|s| s.as_str())
+                .unwrap_or("");
             (body, is_html_type(ctype))
         } else {
             match split_http(&body) {
@@ -224,7 +229,13 @@ fn origin_of(uri: &str) -> Option<String> {
 fn split_http(body: &[u8]) -> Option<(u16, Vec<u8>)> {
     let sep = body.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&body[..sep]).ok()?;
-    let status = head.lines().next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let status = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
     Some((status, body[sep + 4..].to_vec()))
 }
 
@@ -327,9 +338,10 @@ fn collect_rewritable(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result
             collect_rewritable(root, &p, out)?;
             continue;
         }
-        if p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-            matches!(e.to_ascii_lowercase().as_str(), "html" | "htm" | "css")
-        }) {
+        if p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "html" | "htm" | "css"))
+        {
             out.push(p);
         }
     }
@@ -430,10 +442,8 @@ mod tests {
     #[test]
     fn maps_manning_figure() {
         assert_eq!(
-            url_to_rel(
-                "https://drek4537l1klr.cloudfront.net/kimothi/Figures/CH01_F01_Kimothi.png"
-            )
-            .unwrap(),
+            url_to_rel("https://drek4537l1klr.cloudfront.net/kimothi/Figures/CH01_F01_Kimothi.png")
+                .unwrap(),
             "figures/CH01_F01_Kimothi.png"
         );
     }
@@ -537,7 +547,10 @@ mod tests {
                 continue;
             }
             if !version.to_ascii_uppercase().starts_with("WARC/") {
-                panic!("desync at record {n}: {:?}", version.chars().take(40).collect::<String>());
+                panic!(
+                    "desync at record {n}: {:?}",
+                    version.chars().take(40).collect::<String>()
+                );
             }
             let mut headers = HashMap::new();
             loop {
@@ -672,9 +685,8 @@ mod tests {
 
     #[test]
     fn materialize_browsertrix_example_if_present() {
-        let p = PathBuf::from(
-            "/Users/baptisteboussemart/wacz/crawls/collections/example/example.wacz",
-        );
+        let p =
+            PathBuf::from("/Users/baptisteboussemart/wacz/crawls/collections/example/example.wacz");
         if !p.is_file() {
             return;
         }
