@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -20,6 +20,10 @@ pub struct PackServer {
     pub port: u16,
     pub entry: String,
     pub title: String,
+    pub root: PathBuf,
+    pub markdown: bool,
+    /// Rempli par le thread du serveur avant d’accepter les requêtes, si le pack est Markdown.
+    pub index: Arc<OnceLock<crate::md::MdIndex>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -44,10 +48,13 @@ impl PackServer {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
+        let index = Arc::new(OnceLock::new());
+        let index_t = index.clone();
+        let root_t = root.clone();
         thread::Builder::new()
             .name(format!("taurus-{port}"))
             .spawn(move || {
-                serve(server, root, stop_t, markdown);
+                serve(server, root_t, stop_t, markdown, index_t);
                 drop(temp);
             })
             .map_err(|e| format!("thread: {e}"))?;
@@ -56,6 +63,9 @@ impl PackServer {
             port,
             entry,
             title,
+            root,
+            markdown,
+            index,
             stop,
         })
     }
@@ -247,6 +257,33 @@ pub(crate) fn find_archive_in_dir(dir: &Path) -> Option<PathBuf> {
     zip.into_iter().next()
 }
 
+/// Chemin relatif du fichier qu’une URL HTML serait servie, ou `None` s’il
+/// sort de la racine (lien symbolique compris) ou n’existe pas.
+pub(crate) fn html_source(root: &Path, url_path: &str) -> Option<String> {
+    let url_path = url_path.split(['?', '#']).next().unwrap_or(url_path);
+    let rel = crate::md::percent_decode(url_path.trim_start_matches('/').trim_end_matches('/'));
+    if !rel.is_empty()
+        && rel
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    let joined = resolve_served_path(root, &rel)?;
+    let canon = joined.canonicalize().ok()?;
+    let root_c = root.canonicalize().ok()?;
+    if !canon.starts_with(&root_c) || !canon.is_file() {
+        return None;
+    }
+    let rel_path = canon.strip_prefix(&root_c).ok()?;
+    let text = rel_path.to_string_lossy().replace('\\', "/");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 fn resolve_served_path(root: &Path, rel: &str) -> Option<PathBuf> {
     let rel = rel.trim_start_matches('/').trim_end_matches('/');
     let joined = if rel.is_empty() {
@@ -373,12 +410,17 @@ fn content_type(path: &Path) -> String {
     }
 }
 
-fn serve(server: Server, root: PathBuf, stop: Arc<AtomicBool>, markdown: bool) {
-    let md_index = if markdown {
-        Some(crate::md::MdIndex::build(&root))
-    } else {
-        None
-    };
+fn serve(
+    server: Server,
+    root: PathBuf,
+    stop: Arc<AtomicBool>,
+    markdown: bool,
+    index: Arc<OnceLock<crate::md::MdIndex>>,
+) {
+    if markdown {
+        let _ = index.set(crate::md::MdIndex::build(&root));
+    }
+    let md_index = index.get();
     while !stop.load(Ordering::SeqCst) {
         let req = match server.recv_timeout(Duration::from_millis(250)) {
             Ok(Some(r)) => r,

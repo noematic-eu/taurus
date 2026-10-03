@@ -243,6 +243,38 @@ impl MdIndex {
     }
 }
 
+/// Fichier `.md` source d’une URL du lecteur. L’accueil, une recherche et un
+/// dossier n’ont pas de fichier. `/page/Slug` renvoie le `.md` choisi par l’index.
+pub(crate) fn markdown_source(root: &Path, index: &MdIndex, url_path: &str) -> Option<String> {
+    let url_path = url_path.split(['?', '#']).next().unwrap_or(url_path);
+    let path = percent_decode(url_path);
+    let rel = path.trim_start_matches('/').trim_end_matches('/');
+    if !rel.is_empty()
+        && rel
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    if rel.is_empty() || rel == "index.html" || rel == "index.htm" {
+        return None;
+    }
+    if let Some(slug) = rel.strip_prefix("page/") {
+        let file_rel = index.page(slug)?;
+        let path = under_root(root, &root.join(file_rel))?;
+        return path.is_file().then(|| file_rel.to_string());
+    }
+    let name = Path::new(rel)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if !is_md(name) {
+        return None;
+    }
+    let path = under_root(root, &root.join(rel))?;
+    path.is_file().then(|| rel.to_string())
+}
+
 pub(crate) fn dispatch(root: &Path, index: &MdIndex, url: &str) -> Reply {
     let (url_path, query) = match url.split_once('?') {
         Some((path, query)) => (path, Some(query)),
@@ -723,7 +755,7 @@ fn directory_inside(root: &Path, candidate: &Path) -> bool {
     canon.is_dir() && canon.starts_with(&root)
 }
 
-fn under_root(root: &Path, candidate: &Path) -> Option<PathBuf> {
+pub(crate) fn under_root(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     let path = candidate.canonicalize().ok()?;
     if path.starts_with(&root) {
@@ -811,7 +843,7 @@ fn encode_component(s: &str) -> String {
     out
 }
 
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

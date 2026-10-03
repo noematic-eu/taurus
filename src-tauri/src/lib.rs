@@ -1,9 +1,11 @@
+mod ask;
 mod md;
 mod pack;
 mod wacz;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use pack::PackServer;
 use tauri::Manager;
@@ -12,25 +14,113 @@ use tauri_plugin_dialog::DialogExt;
 
 static PACK_ID: AtomicU64 = AtomicU64::new(1);
 
+struct Shutdown {
+    once: AtomicBool,
+    server: Arc<PackServer>,
+    app: tauri::AppHandle,
+    id: u64,
+    pack_label: String,
+    ask_label: String,
+}
+
+impl Shutdown {
+    fn close(&self) {
+        if self.once.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(store) = self.app.try_state::<ask::AskStore>() {
+            store.remove(self.id);
+        }
+        self.server.stop();
+        if let Some(window) = self.app.get_webview_window(&self.pack_label) {
+            let _ = window.close();
+        }
+        if let Some(window) = self.app.get_webview_window(&self.ask_label) {
+            let _ = window.close();
+        }
+    }
+}
+
 fn open_pack(app: &tauri::AppHandle, pack_path: PathBuf) -> Result<String, String> {
-    let server = PackServer::open(&pack_path)?;
+    let server = Arc::new(PackServer::open(&pack_path)?);
     let url = server.url();
     let title = format!("Taurus — {}", server.title);
     let id = PACK_ID.fetch_add(1, Ordering::SeqCst);
-    let label = format!("pack-{id}");
+    let pack_label = format!("pack-{id}");
+    let ask_label = format!("ask-{id}");
+    let parsed: tauri::Url = url.parse().map_err(|e| {
+        server.stop();
+        format!("url: {e}")
+    })?;
+    let live = Arc::new(ask::LivePack::new(
+        server.root.clone(),
+        server.markdown,
+        server.port,
+        server.index.clone(),
+    ));
+    app.state::<ask::AskStore>().insert(id, live.clone());
 
-    let win = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url.parse().unwrap()))
+    let nav = live.clone();
+    let pack = WebviewWindowBuilder::new(app, &pack_label, WebviewUrl::External(parsed.clone()))
         .title(&title)
         .inner_size(1100.0, 800.0)
+        .on_navigation(move |url| {
+            nav.note(url);
+            true
+        })
         .build()
-        .map_err(|e| format!("fenêtre: {e}"))?;
+        .map_err(|e| {
+            app.state::<ask::AskStore>().remove(id);
+            server.stop();
+            format!("fenêtre: {e}")
+        })?;
 
-    win.on_window_event(move |event| {
+    let ask = match WebviewWindowBuilder::new(app, &ask_label, WebviewUrl::App("ask.html".into()))
+        .title(format!("Interroger — {}", server.title))
+        .inner_size(440.0, 760.0)
+        .focused(false)
+        .build()
+    {
+        Ok(window) => window,
+        Err(e) => {
+            let _ = pack.close();
+            app.state::<ask::AskStore>().remove(id);
+            server.stop();
+            return Err(format!("fenêtre: {e}"));
+        }
+    };
+
+    if let (Ok(pos), Ok(size)) = (pack.outer_position(), pack.outer_size()) {
+        let _ = ask.set_position(tauri::PhysicalPosition::new(
+            pos.x + size.width as i32 + 12,
+            pos.y,
+        ));
+    }
+    live.note(&parsed);
+
+    let shutdown = Arc::new(Shutdown {
+        once: AtomicBool::new(false),
+        server,
+        app: app.clone(),
+        id,
+        pack_label,
+        ask_label,
+    });
+    let on_pack = shutdown.clone();
+    pack.on_window_event(move |event| {
         if matches!(
             event,
             WindowEvent::Destroyed | WindowEvent::CloseRequested { .. }
         ) {
-            server.stop();
+            on_pack.close();
+        }
+    });
+    ask.on_window_event(move |event| {
+        if matches!(
+            event,
+            WindowEvent::Destroyed | WindowEvent::CloseRequested { .. }
+        ) {
+            shutdown.close();
         }
     });
 
@@ -74,6 +164,35 @@ fn open_pack_path(app: tauri::AppHandle, path: String) -> Result<String, String>
     open_pack(&app, PathBuf::from(path))
 }
 
+#[tauri::command]
+fn ask_state(app: tauri::AppHandle, id: u64) -> Result<ask::AskView, String> {
+    Ok(app.state::<ask::AskStore>().get(id)?.view())
+}
+
+#[tauri::command]
+fn ask_add(app: tauri::AppHandle, id: u64) -> Result<ask::AskView, String> {
+    app.state::<ask::AskStore>().get(id)?.add_current()
+}
+
+#[tauri::command]
+fn ask_remove(app: tauri::AppHandle, id: u64, rel: String) -> Result<ask::AskView, String> {
+    Ok(app.state::<ask::AskStore>().get(id)?.remove(&rel))
+}
+
+#[tauri::command]
+async fn ask_question(
+    app: tauri::AppHandle,
+    id: u64,
+    question: String,
+) -> Result<ask::AskReply, String> {
+    let pack = app.state::<ask::AskStore>().get(id)?;
+    let host = ask::ollama_host();
+    let model = ask::ollama_model();
+    tauri::async_runtime::spawn_blocking(move || pack.question(&question, &host, model.as_deref()))
+        .await
+        .map_err(|_| "Interrogation interrompue.".to_string())?
+}
+
 fn drop_packs(app: &tauri::AppHandle, paths: &[PathBuf]) {
     for p in paths {
         if is_pack(p) {
@@ -103,9 +222,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pick_pack,
             pick_folder,
-            open_pack_path
+            open_pack_path,
+            ask_state,
+            ask_add,
+            ask_remove,
+            ask_question
         ])
         .setup(|app| {
+            app.manage(ask::AskStore::default());
             let handle = app.handle().clone();
             if let Some(main) = app.get_webview_window("main") {
                 main.on_window_event(move |event| {

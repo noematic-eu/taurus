@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Interroger</title>
+    <script type="module" src="ask.js" defer></script>
+  </head>
+  <body>
+    <main class="wrap ask">
+      <p class="kicker">Ollama</p>
+      <h1>Interroger</h1>
+
+      <p class="label">Page courante</p>
+      <p id="current" class="path">Aucune page courante.</p>
+      <button type="button" id="add" class="btn">Ajouter cette page</button>
+
+      <p id="note" class="lede">La question portera sur la page courante.</p>
+
+      <p class="label">Lot</p>
+      <ul id="batch" class="batch"></ul>
+
+      <label for="q">Question</label>
+      <textarea id="q" rows="4" placeholder="Résume."></textarea>
+      <button type="button" id="go" class="btn">Interroger</button>
+
+      <p id="pending" class="meta" hidden>Interrogation en cours…</p>
+      <p id="error" class="status" hidden></p>
+
+      <p class="label">Réponse</p>
+      <article id="answer" class="answer"></article>
+
+      <p class="label">Fichiers envoyés</p>
+      <ul id="files" class="batch"></ul>
+    </main>
+  </body>
+</html>
