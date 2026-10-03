@@ -193,6 +193,29 @@ async fn ask_question(
         .map_err(|_| "Interrogation interrompue.".to_string())?
 }
 
+#[tauri::command]
+async fn ask_models(app: tauri::AppHandle, id: u64) -> Result<ask::ModelView, String> {
+    let pack = app.state::<ask::AskStore>().get(id)?;
+    let host = ask::ollama_host();
+    let preferred = ask::ollama_model();
+    tauri::async_runtime::spawn_blocking(move || pack.models(&host, preferred.as_deref()))
+        .await
+        .map_err(|_| "Interrogation interrompue.".to_string())?
+}
+
+#[tauri::command]
+async fn ask_set_model(
+    app: tauri::AppHandle,
+    id: u64,
+    model: String,
+) -> Result<ask::ModelView, String> {
+    let pack = app.state::<ask::AskStore>().get(id)?;
+    let host = ask::ollama_host();
+    tauri::async_runtime::spawn_blocking(move || pack.set_model(&host, &model))
+        .await
+        .map_err(|_| "Interrogation interrompue.".to_string())?
+}
+
 fn drop_packs(app: &tauri::AppHandle, paths: &[PathBuf]) {
     for p in paths {
         if is_pack(p) {
@@ -226,7 +249,9 @@ pub fn run() {
             ask_state,
             ask_add,
             ask_remove,
-            ask_question
+            ask_question,
+            ask_models,
+            ask_set_model
         ])
         .setup(|app| {
             app.manage(ask::AskStore::default());
@@ -261,7 +286,19 @@ pub fn run() {
                 if let tauri::RunEvent::Opened { urls } = event {
                     let paths: Vec<PathBuf> =
                         urls.iter().filter_map(|u| u.to_file_path().ok()).collect();
-                    drop_packs(handle, &paths);
+                    if paths.is_empty() {
+                        return;
+                    }
+                    let handle = handle.clone();
+                    // Ce callback est `application:openURLs:`, un extern "C".
+                    // Créer les fenêtres dedans panique et macOS aborte le
+                    // processus. On les ouvre au tour suivant de la boucle.
+                    std::thread::spawn(move || {
+                        let app = handle.clone();
+                        let _ = handle.run_on_main_thread(move || {
+                            drop_packs(&app, &paths);
+                        });
+                    });
                 }
             },
         );

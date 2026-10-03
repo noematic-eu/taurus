@@ -142,9 +142,14 @@ h1 {
   margin: 0.85rem 0 0;
 }
 
-.ask textarea {
+.ask label {
+  display: block;
+  margin: 1.1rem 0 0.35rem;
+}
+
+.ask textarea,
+.ask select {
   width: 100%;
-  min-height: 6rem;
   padding: 0.55rem 0.7rem;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -152,7 +157,38 @@ h1 {
   color: inherit;
   font: inherit;
   font-size: 1rem;
+}
+
+.ask textarea {
+  min-height: 6rem;
   resize: vertical;
+}
+
+.ask select {
+  margin: 0;
+}
+
+.meta.full {
+  color: var(--ko);
+}
+
+.meter {
+  height: 0.28rem;
+  margin: 0.45rem 0 0;
+  background: var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.meter span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--teal);
+}
+
+.meter.full span {
+  background: var(--ko);
 }
 
 .btn {

@@ -8,6 +8,8 @@ fn main() {
             "ask_add",
             "ask_remove",
             "ask_question",
+            "ask_models",
+            "ask_set_model",
         ]),
     ))
     .expect("erreur du script de build Tauri");
