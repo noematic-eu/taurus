@@ -3641,6 +3641,9 @@ version = "0.2.0"
 dependencies = [
  "flate2",
  "mime_guess",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "pulldown-cmark",
  "serde",
  "serde_json",

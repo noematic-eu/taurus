@@ -10,6 +10,9 @@ fn main() {
             "ask_question",
             "ask_models",
             "ask_set_model",
+            "ask_save",
+            "ask_open",
+            "ask_rendered",
         ]),
     ))
     .expect("erreur du script de build Tauri");

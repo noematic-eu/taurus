@@ -5,18 +5,22 @@
 //! configuré. La liste des modèles et la taille de fenêtre sont lues avant.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
 use serde::Serialize;
 
 pub(crate) const DOC_CHARS: usize = 12_000;
 pub(crate) const BATCH_MAX: usize = 8;
-const CHAT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Silence maximale pendant une génération. Les jetons qui arrivent
+/// repoussent cette limite : un modèle lent peut donc dépasser deux minutes.
+const CHAT_TIMEOUT: Duration = Duration::from_secs(600);
 const TAGS_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) const SYSTEM_PROMPT: &str = "\
 Tu réponds uniquement à partir des documents fournis. Si ces documents ne permettent pas de répondre, dis-le. Pour chaque passage utilisé, cite le nom de fichier entre crochets, par exemple [France_grokipedia.md]. N’invente pas de source. Réponds en français, de façon concise.";
@@ -44,9 +48,16 @@ pub(crate) struct ModelView {
 #[derive(Debug, Serialize)]
 pub(crate) struct AskReply {
     pub answer: String,
+    /// HTML sûr, produit depuis `answer`.
+    pub html: String,
     pub files: Vec<String>,
     pub prompt_tokens: Option<u64>,
     pub context_tokens: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AnswerPage {
+    pub html: String,
 }
 
 pub(crate) struct LivePack {
@@ -60,6 +71,13 @@ pub(crate) struct LivePack {
     model: Mutex<Option<String>>,
     context_tokens: Mutex<Option<u64>>,
     prompt_tokens: Mutex<Option<u64>>,
+    /// Markdown de la dernière réponse réussie.
+    answer: Mutex<Option<String>>,
+    /// Markdown affiché par la fenêtre Réponse. Une question plus récente
+    /// ne change pas ce que cette fenêtre enregistre.
+    shown: Mutex<Option<String>>,
+    /// Dossier proposé au panneau. Pour une archive, ce n’est pas l’extraction.
+    save_dir: PathBuf,
     /// Dernier choix de modèle. Une réponse Ollama tardive ne réécrit pas
     /// un choix commencé après.
     choice_gen: Mutex<u64>,
@@ -72,6 +90,7 @@ impl LivePack {
         port: u16,
         index: Arc<OnceLock<crate::md::MdIndex>>,
     ) -> Self {
+        let save_dir = root.clone();
         Self {
             root,
             markdown,
@@ -83,8 +102,38 @@ impl LivePack {
             model: Mutex::new(None),
             context_tokens: Mutex::new(None),
             prompt_tokens: Mutex::new(None),
+            answer: Mutex::new(None),
+            shown: Mutex::new(None),
+            save_dir,
             choice_gen: Mutex::new(0),
         }
+    }
+
+    /// Une archive s’enregistre à côté du fichier, pas dans l’extraction.
+    pub(crate) fn point_save_at(&mut self, opened: &Path) {
+        self.save_dir = durable_save_dir(opened, &self.root);
+    }
+
+    pub(crate) fn save_directory(&self) -> &Path {
+        &self.save_dir
+    }
+
+    /// Vrai quand le fichier disparaîtrait avec le dossier temporaire d’une archive.
+    pub(crate) fn save_lands_in_temp(&self, path: &Path) -> bool {
+        if self.save_dir == self.root {
+            return false;
+        }
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        let parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        parent.starts_with(&root)
     }
 
     fn begin_choice(&self) -> u64 {
@@ -266,7 +315,7 @@ impl LivePack {
         };
         let (answer, prompt_tokens) = post_chat(host, &model, &user)?;
         let loaded = running_context(host, &model);
-        // Le choix a pu changer pendant les 120 s de la question.
+        // Le choix a pu changer pendant la question.
         let current = lock(&self.model).clone();
         let still = match current.as_deref() {
             Some(name) => name == model,
@@ -281,13 +330,63 @@ impl LivePack {
             }
             *lock(&self.prompt_tokens) = prompt_tokens;
         }
+        *lock(&self.answer) = Some(answer.clone());
+        let html = render_answer(&answer);
         Ok(AskReply {
             answer,
+            html,
             files: rels,
             prompt_tokens: still.then_some(prompt_tokens).flatten(),
             context_tokens: *lock(&self.context_tokens),
         })
     }
+
+    pub(crate) fn answer_text(&self) -> Result<String, String> {
+        lock(&self.answer)
+            .clone()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| "Aucune réponse.".to_string())
+    }
+
+    pub(crate) fn answer_page(&self) -> Result<AnswerPage, String> {
+        let markdown = self.answer_text()?;
+        *lock(&self.shown) = Some(markdown.clone());
+        Ok(AnswerPage {
+            html: render_answer(&markdown),
+        })
+    }
+
+    /// Markdown que la fenêtre Réponse montre, pas la dernière question.
+    pub(crate) fn shown_markdown(&self) -> Result<String, String> {
+        lock(&self.shown)
+            .clone()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| "Aucune réponse.".to_string())
+    }
+}
+
+/// Dossier durable pour le panneau. Une archive ouverte ne propose pas son extraction.
+pub(crate) fn durable_save_dir(opened: &Path, served_root: &Path) -> PathBuf {
+    if opened.is_file() {
+        if let Some(parent) = opened.parent().filter(|parent| parent.is_dir()) {
+            return parent.to_path_buf();
+        }
+        return fallback_save_dir();
+    }
+    if served_root.is_dir() {
+        return served_root.to_path_buf();
+    }
+    if opened.is_dir() {
+        return opened.to_path_buf();
+    }
+    fallback_save_dir()
+}
+
+fn fallback_save_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Choix du pack s’il est installé, sinon le préféré s’il l’est, sinon le premier.
@@ -622,9 +721,12 @@ fn running_context(host: &str, model: &str) -> Option<u64> {
 
 fn post_chat(host: &str, model: &str, user: &str) -> Result<(String, Option<u64>), String> {
     // Pas d’options.num_ctx : la fenêtre est affichée, pas agrandie.
+    // Le flux garde la connexion active pendant la génération. think false
+    // demande la réponse sans la trace de raisonnement, qui dépassait le délai.
     let payload = serde_json::json!({
         "model": model,
-        "stream": false,
+        "stream": true,
+        "think": false,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user}
@@ -632,15 +734,115 @@ fn post_chat(host: &str, model: &str, user: &str) -> Result<(String, Option<u64>
     });
     let bytes = serde_json::to_vec(&payload).map_err(|e| format!("json: {e}"))?;
     let body = http_exchange(host, "POST", "/api/chat", Some(&bytes), CHAT_TIMEOUT)?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| "Réponse Ollama illisible.".to_string())?;
-    let answer = value["message"]["content"]
-        .as_str()
-        .map(str::to_string)
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| "Ollama n’a pas renvoyé de réponse.".to_string())?;
-    let prompt_tokens = json_u64(&value["prompt_eval_count"]).filter(|n| *n > 0);
+    parse_chat_body(&body, host)
+}
+
+/// Concatène les deltas de `/api/chat`. Un objet unique, sans flux, convient aussi.
+/// Sans `"done": true`, le texte déjà reçu n’est pas une réponse.
+fn parse_chat_body(body: &[u8], host: &str) -> Result<(String, Option<u64>), String> {
+    let text = std::str::from_utf8(body).map_err(|_| "Réponse Ollama illisible.".to_string())?;
+    let mut answer = String::new();
+    let mut prompt_tokens = None;
+    let mut saw = false;
+    let mut done = false;
+    for line in text.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(|_| "Réponse Ollama illisible.".to_string())?;
+        if let Some(err) = value.get("error").and_then(|v| v.as_str()).map(str::trim) {
+            if !err.is_empty() {
+                return Err(format!("Ollama : {err}"));
+            }
+        }
+        if let Some(chunk) = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_str())
+        {
+            answer.push_str(chunk);
+        }
+        if let Some(n) = json_u64(&value["prompt_eval_count"]).filter(|n| *n > 0) {
+            prompt_tokens = Some(n);
+        }
+        if value.get("done").and_then(|flag| flag.as_bool()) == Some(true) {
+            done = true;
+        }
+        saw = true;
+    }
+    if !saw {
+        return Err("Réponse Ollama illisible.".into());
+    }
+    if !done {
+        return Err(format!("Ollama n’a pas terminé à temps ({host})."));
+    }
+    if answer.is_empty() {
+        return Err("Ollama n’a pas renvoyé de réponse.".into());
+    }
     Ok((answer, prompt_tokens))
+}
+
+/// HTML de la réponse. Le HTML brut du modèle devient du texte.
+pub(crate) fn render_answer(markdown: &str) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(markdown, options);
+    let events = parser.map(|event| match event {
+        Event::Html(text) | Event::InlineHtml(text) => Event::Text(text),
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: safe_url(dest_url),
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url: _,
+            title,
+            id,
+        }) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: CowStr::from("#"),
+            title,
+            id,
+        }),
+        other => other,
+    });
+    let mut out = String::new();
+    html::push_html(&mut out, events);
+    out
+}
+
+fn safe_url(dest: CowStr<'_>) -> CowStr<'static> {
+    let trimmed = dest.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let http = lower.starts_with("https://") || lower.starts_with("http://");
+    if http
+        && !trimmed
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        CowStr::from(trimmed.to_string())
+    } else {
+        CowStr::from("#")
+    }
+}
+
+/// Ajoute `.md` seulement quand le chemin choisi n’a pas d’extension.
+pub(crate) fn markdown_save_path(path: PathBuf) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if !ext.is_empty() => path,
+        _ => path.with_extension("md"),
+    }
 }
 
 fn http_exchange(
@@ -656,13 +858,14 @@ fn http_exchange(
         .map_err(|_| format!("Ollama ne répond pas à {host}."))?
         .next()
         .ok_or_else(|| format!("Ollama ne répond pas à {host}."))?;
-    let mut stream = TcpStream::connect_timeout(&sock, timeout)
+    let connect_for = timeout.min(CONNECT_TIMEOUT);
+    let mut stream = TcpStream::connect_timeout(&sock, connect_for)
         .map_err(|_| format!("Ollama ne répond pas à {host}."))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|_| format!("Ollama ne répond pas à {host}."))?;
     stream
-        .set_write_timeout(Some(timeout))
+        .set_write_timeout(Some(connect_for))
         .map_err(|_| format!("Ollama ne répond pas à {host}."))?;
 
     let body = body.unwrap_or(b"");
@@ -674,10 +877,7 @@ fn http_exchange(
         .write_all(header.as_bytes())
         .and_then(|_| stream.write_all(body))
         .map_err(|_| format!("Ollama ne répond pas à {host}."))?;
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|_| format!("Ollama ne répond pas à {host}."))?;
+    let buf = read_http(&mut stream, host)?;
     let sep = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -692,17 +892,158 @@ fn http_exchange(
         .nth(1)
         .and_then(|code| code.parse().ok())
         .ok_or_else(|| "Réponse Ollama illisible.".to_string())?;
-    if !(200..300).contains(&status) {
-        return Err(format!("Ollama a répondu {status}."));
-    }
     let rest = &buf[sep + 4..];
+    let chunked = head.to_ascii_lowercase().lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("transfer-encoding:") && line.contains("chunked")
+    });
+    let payload = if chunked {
+        decode_chunked(rest)?
+    } else if let Some(len) = content_length(head) {
+        if rest.len() < len {
+            return Err(format!("Ollama n’a pas terminé à temps ({host})."));
+        }
+        rest[..len].to_vec()
+    } else {
+        rest.to_vec()
+    };
+    if !(200..300).contains(&status) {
+        return Err(status_error(status, &payload));
+    }
+    Ok(payload)
+}
+
+/// Lit jusqu’à une réponse complète. Un délai sans aucun octet, ou au milieu
+/// d’une réponse inachevée, n’est pas une absence d’Ollama.
+fn read_http(stream: &mut TcpStream, host: &str) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                if buf.is_empty() {
+                    return Err(format!("Ollama ne répond pas à {host}."));
+                }
+                if message_complete(&buf) || close_delimited(&buf) {
+                    break;
+                }
+                return Err(format!("Ollama n’a pas terminé à temps ({host})."));
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if message_complete(&buf) {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err)
+                if err.kind() == ErrorKind::TimedOut || err.kind() == ErrorKind::WouldBlock =>
+            {
+                if message_complete(&buf) {
+                    break;
+                }
+                return Err(format!("Ollama n’a pas terminé à temps ({host})."));
+            }
+            Err(_) => return Err(format!("Ollama ne répond pas à {host}.")),
+        }
+    }
+    if buf.is_empty() {
+        return Err(format!("Ollama ne répond pas à {host}."));
+    }
+    Ok(buf)
+}
+
+fn message_complete(buf: &[u8]) -> bool {
+    let Some(sep) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&buf[..sep]) else {
+        return false;
+    };
+    let body = &buf[sep + 4..];
     if head.to_ascii_lowercase().lines().any(|line| {
         let line = line.trim();
         line.starts_with("transfer-encoding:") && line.contains("chunked")
     }) {
-        decode_chunked(rest)
-    } else {
-        Ok(rest.to_vec())
+        return chunked_finished(body);
+    }
+    content_length(head).is_some_and(|len| body.len() >= len)
+}
+
+/// Fin de réponse seulement quand ni chunked ni Content-Length ne bornent le corps.
+fn close_delimited(buf: &[u8]) -> bool {
+    let Some(sep) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&buf[..sep]) else {
+        return false;
+    };
+    let chunked = head.to_ascii_lowercase().lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("transfer-encoding:") && line.contains("chunked")
+    });
+    !chunked && content_length(head).is_none()
+}
+
+fn content_length(head: &str) -> Option<usize> {
+    head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+fn chunked_finished(input: &[u8]) -> bool {
+    let mut i = 0;
+    while i < input.len() {
+        let Some(line_end) = input[i..].windows(2).position(|w| w == b"\r\n") else {
+            return false;
+        };
+        let Ok(size_txt) = std::str::from_utf8(&input[i..i + line_end]) else {
+            return false;
+        };
+        let size_txt = size_txt.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_txt, 16) else {
+            return false;
+        };
+        let Some(after_size) = i.checked_add(line_end + 2) else {
+            return false;
+        };
+        i = after_size;
+        if size == 0 {
+            return true;
+        }
+        let Some(next) = i.checked_add(size).and_then(|end| end.checked_add(2)) else {
+            return false;
+        };
+        if next > input.len() {
+            return false;
+        }
+        i = next;
+    }
+    false
+}
+
+fn status_error(status: u16, body: &[u8]) -> String {
+    let detail = std::str::from_utf8(body)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok())
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|err| err.as_str())
+                .map(str::trim)
+                .filter(|err| !err.is_empty())
+                .map(str::to_string)
+        });
+    match detail {
+        Some(detail) => {
+            let short: String = detail.chars().take(180).collect();
+            format!("Ollama a répondu {status} : {short}")
+        }
+        None => format!("Ollama a répondu {status}."),
     }
 }
 
@@ -730,6 +1071,7 @@ fn parse_http_host(host: &str) -> Result<(String, u16), String> {
 fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut i = 0;
+    let mut finished = false;
     while i < input.len() {
         let line_end = input[i..]
             .windows(2)
@@ -740,16 +1082,26 @@ fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {
         let size_txt = size_txt.split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_txt, 16)
             .map_err(|_| "Réponse Ollama illisible.".to_string())?;
-        i += line_end + 2;
+        i = i
+            .checked_add(line_end + 2)
+            .ok_or_else(|| "Réponse Ollama illisible.".to_string())?;
         if size == 0 {
+            finished = true;
             break;
         }
-        let end = i + size;
+        let end = i
+            .checked_add(size)
+            .ok_or_else(|| "Réponse Ollama illisible.".to_string())?;
         if end > input.len() {
             return Err("Réponse Ollama illisible.".into());
         }
         out.extend_from_slice(&input[i..end]);
-        i = end + 2;
+        i = end
+            .checked_add(2)
+            .ok_or_else(|| "Réponse Ollama illisible.".to_string())?;
+    }
+    if !finished {
+        return Err("Réponse Ollama illisible.".into());
     }
     Ok(out)
 }
@@ -932,7 +1284,8 @@ mod tests {
             req.as_reader().read_to_string(&mut body).unwrap();
             let value: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(value["model"], "modele-test");
-            assert_eq!(value["stream"], false);
+            assert_eq!(value["stream"], true);
+            assert_eq!(value["think"], false);
             assert!(value.get("options").is_none(), "{value}");
             assert_eq!(value["messages"][0]["role"], "system");
             assert_eq!(
@@ -945,7 +1298,7 @@ mod tests {
             assert!(!user.contains("nope()"), "{user}");
             assert!(user.contains("Question : Résume."), "{user}");
             saw_t.store(true, Ordering::SeqCst);
-            let resp = r#"{"message":{"role":"assistant","content":"Réponse fixe."}}"#;
+            let resp = r#"{"message":{"role":"assistant","content":"Réponse fixe."},"done":true}"#;
             req.respond(tiny_http::Response::from_string(resp)).unwrap();
         });
 
@@ -962,6 +1315,17 @@ mod tests {
         handle.join().unwrap();
         assert!(saw.load(Ordering::SeqCst));
         assert_eq!(reply.answer, "Réponse fixe.");
+        assert!(
+            reply.html.contains("Réponse fixe."),
+            "{html}",
+            html = reply.html
+        );
+        assert!(
+            !reply.html.to_lowercase().contains("<script"),
+            "{}",
+            reply.html
+        );
+        assert_eq!(pack.answer_text().unwrap(), "Réponse fixe.");
         assert_eq!(reply.files, vec!["index.html".to_string()]);
         assert_eq!(reply.prompt_tokens, None);
     }
@@ -1092,10 +1456,11 @@ mod tests {
             req.as_reader().read_to_string(&mut body).unwrap();
             let value: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(value["model"], "deux");
-            assert_eq!(value["stream"], false);
+            assert_eq!(value["stream"], true);
+            assert_eq!(value["think"], false);
             assert!(value.get("options").is_none(), "{value}");
             req.respond(tiny_http::Response::from_string(
-                r#"{"message":{"role":"assistant","content":"Vu."},"prompt_eval_count":321}"#,
+                r#"{"message":{"role":"assistant","content":"Vu."},"prompt_eval_count":321,"done":true}"#,
             ))
             .unwrap();
 
@@ -1170,7 +1535,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(value["model"], "un");
             req.respond(tiny_http::Response::from_string(
-                r#"{"message":{"role":"assistant","content":"Vu."},"prompt_eval_count":4}"#,
+                r#"{"message":{"role":"assistant","content":"Vu."},"prompt_eval_count":4,"done":true}"#,
             ))
             .unwrap();
             let req = recv(&server);
@@ -1260,7 +1625,7 @@ mod tests {
                 }
             }
             chat.respond(tiny_http::Response::from_string(
-                r#"{"message":{"role":"assistant","content":"Tard."},"prompt_eval_count":77}"#,
+                r#"{"message":{"role":"assistant","content":"Tard."},"prompt_eval_count":77,"done":true}"#,
             ))
             .unwrap();
             let req = recv(&server);
@@ -1294,5 +1659,252 @@ mod tests {
         assert_eq!(view.model.as_deref(), Some("deux"));
         assert_eq!(view.prompt_tokens, None);
         assert_eq!(view.context_tokens, Some(8192));
+    }
+
+    #[test]
+    fn answer_markdown_renders_and_raw_html_stays_text() {
+        let html = render_answer(
+            "# Titre\n\nUn **mot**.\n\n<script>alert(1)</script>\n\n[lien](javascript:alert(1))\n\n![img](https://example.test/a.png)\n\n[doc](https://example.test/a)\n",
+        );
+        assert!(html.contains("<h1>"), "{html}");
+        assert!(html.contains("<strong>mot</strong>"), "{html}");
+        assert!(!html.to_lowercase().contains("<script"), "{html}");
+        assert!(html.contains("alert(1)"), "{html}");
+        assert!(!html.to_lowercase().contains("javascript:"), "{html}");
+        assert!(!html.contains("example.test/a.png"), "{html}");
+        assert!(html.contains("https://example.test/a"), "{html}");
+        assert_eq!(
+            markdown_save_path(PathBuf::from("reponse"))
+                .extension()
+                .unwrap(),
+            "md"
+        );
+        assert_eq!(
+            markdown_save_path(PathBuf::from("note.txt"))
+                .extension()
+                .unwrap(),
+            "txt"
+        );
+        assert_eq!(
+            markdown_save_path(PathBuf::from("deja.md"))
+                .file_name()
+                .unwrap(),
+            "deja.md"
+        );
+        let pack = LivePack::new(PathBuf::from("."), false, 9, Arc::new(OnceLock::new()));
+        assert!(pack.answer_text().unwrap_err().contains("Aucune"));
+    }
+
+    #[test]
+    fn streamed_chat_joins_deltas_and_reads_prompt_tokens() {
+        let body = b"{\"message\":{\"content\":\"R\xc3\xa9\"},\"done\":false}\n{\"message\":{\"content\":\"ponse.\"},\"done\":false}\n{\"message\":{\"content\":\"\"},\"done\":true,\"prompt_eval_count\":321}\n";
+        let (answer, tokens) = parse_chat_body(body, "http://127.0.0.1:9").unwrap();
+        assert_eq!(answer, "Réponse.");
+        assert_eq!(tokens, Some(321));
+
+        let err = parse_chat_body(
+            r#"{"error":"mémoire insuffisante"}"#.as_bytes(),
+            "http://127.0.0.1:9",
+        )
+        .unwrap_err();
+        assert!(err.contains("mémoire insuffisante"), "{err}");
+        let err = parse_chat_body(
+            br#"{"message":{"content":""},"done":true}"#,
+            "http://127.0.0.1:9",
+        )
+        .unwrap_err();
+        assert!(err.contains("pas renvoyé"), "{err}");
+        let err = parse_chat_body(
+            br#"{"message":{"content":"partiel"},"done":false}"#,
+            "http://127.0.0.1:9",
+        )
+        .unwrap_err();
+        assert!(err.contains("pas terminé"), "{err}");
+    }
+
+    #[test]
+    fn http_message_is_complete_once_the_body_has_arrived() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        assert!(message_complete(raw));
+        assert!(!message_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel"
+        ));
+        let chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        assert!(message_complete(chunked));
+        assert!(!message_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+        ));
+    }
+
+    #[test]
+    fn open_connection_returns_as_soon_as_content_length_is_reached() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: keep-alive\r\n\r\n{\"ok\":true}")
+                .unwrap();
+            thread::sleep(Duration::from_millis(800));
+        });
+        let started = std::time::Instant::now();
+        let body = http_exchange(
+            &format!("http://127.0.0.1:{port}"),
+            "GET",
+            "/api/tags",
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "attente {:?}",
+            started.elapsed()
+        );
+        assert_eq!(body, b"{\"ok\":true}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn silent_ollama_is_still_working_not_absent() {
+        let (port, server) = listen();
+        let handle = thread::spawn(move || {
+            let _req = recv(&server);
+            thread::sleep(Duration::from_millis(800));
+        });
+        let err = http_exchange(
+            &format!("http://127.0.0.1:{port}"),
+            "GET",
+            "/api/tags",
+            None,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(err.contains("pas terminé"), "{err}");
+        assert!(!err.contains("ne répond pas"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn closed_chunk_without_terminator_is_unfinished() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n")
+                .unwrap();
+        });
+        let err = http_exchange(
+            &format!("http://127.0.0.1:{port}"),
+            "GET",
+            "/api/tags",
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(err.contains("pas terminé"), "{err}");
+        handle.join().unwrap();
+        assert!(decode_chunked(b"5\r\nhello\r\n").is_err());
+        assert_eq!(
+            decode_chunked(b"5\r\nhello\r\n0\r\n\r\n").unwrap(),
+            b"hello"
+        );
+        assert!(!chunked_finished(b"ffffffffffffffff\r\n"));
+    }
+
+    #[test]
+    fn short_content_length_then_close_is_unfinished() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\"",
+            )
+            .unwrap();
+        });
+        let err = http_exchange(
+            &format!("http://127.0.0.1:{port}"),
+            "GET",
+            "/api/tags",
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(err.contains("pas terminé"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn close_delimited_body_is_complete() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true}")
+                .unwrap();
+        });
+        let body = http_exchange(
+            &format!("http://127.0.0.1:{port}"),
+            "GET",
+            "/api/tags",
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(body, b"{\"ok\":true}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn reply_keeps_the_markdown_it_showed() {
+        let pack = LivePack::new(PathBuf::from("."), false, 9, Arc::new(OnceLock::new()));
+        *lock(&pack.answer) = Some("Ancien.".into());
+        let page = pack.answer_page().unwrap();
+        assert!(page.html.contains("Ancien"), "{}", page.html);
+        *lock(&pack.answer) = Some("Nouveau.".into());
+        assert_eq!(pack.shown_markdown().unwrap(), "Ancien.");
+        assert_eq!(pack.answer_text().unwrap(), "Nouveau.");
+    }
+
+    #[test]
+    fn archive_save_starts_beside_the_file_not_in_the_extraction() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let zip = archive_dir.path().join("site.zip");
+        fs::write(&zip, b"zip").unwrap();
+        let extracted = tempfile::tempdir().unwrap();
+        let mut pack = LivePack::new(
+            extracted.path().to_path_buf(),
+            false,
+            9,
+            Arc::new(OnceLock::new()),
+        );
+        pack.point_save_at(&zip);
+        assert_eq!(pack.save_directory(), archive_dir.path());
+        assert!(pack.save_lands_in_temp(&extracted.path().join("reponse.md")));
+        assert!(!pack.save_lands_in_temp(&archive_dir.path().join("reponse.md")));
+
+        let folder = tempfile::tempdir().unwrap();
+        let mut folder_pack = LivePack::new(
+            folder.path().to_path_buf(),
+            false,
+            9,
+            Arc::new(OnceLock::new()),
+        );
+        folder_pack.point_save_at(folder.path());
+        assert_eq!(folder_pack.save_directory(), folder.path());
+        assert!(!folder_pack.save_lands_in_temp(&folder.path().join("reponse.md")));
     }
 }

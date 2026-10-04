@@ -232,8 +232,121 @@ h1 {
   flex: none;
 }
 
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.85rem;
+}
+
+.actions .btn {
+  margin-top: 0;
+}
+
+.btn.ghost {
+  background: transparent;
+  color: var(--teal);
+  border: 1px solid var(--line);
+}
+
 .answer {
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+  overflow-x: auto;
   margin: 0;
+}
+
+.answer:empty {
+  display: none;
+}
+
+.answer > :first-child {
+  margin-top: 0;
+}
+
+.answer > :last-child {
+  margin-bottom: 0;
+}
+
+.answer h1,
+.answer h2,
+.answer h3 {
+  color: var(--navy);
+  line-height: 1.2;
+  margin: 1rem 0 0.4rem;
+}
+
+.answer h1 {
+  font-size: 1.35rem;
+}
+
+.answer h2 {
+  font-size: 1.15rem;
+}
+
+.answer h3 {
+  font-size: 1.05rem;
+}
+
+.answer p,
+.answer ul,
+.answer ol,
+.answer blockquote,
+.answer pre,
+.answer table {
+  margin: 0.6rem 0;
+}
+
+.answer ul,
+.answer ol {
+  padding-left: 1.2rem;
+}
+
+.answer blockquote {
+  margin-left: 0;
+  padding-left: 0.8rem;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}
+
+.answer pre {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.7rem 0.8rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.answer code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.86em;
+}
+
+.answer :not(pre) > code {
+  background: var(--card);
+  padding: 0.05rem 0.25rem;
+  border-radius: 4px;
+}
+
+.answer table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.92rem;
+}
+
+.answer th,
+.answer td {
+  border: 1px solid var(--line);
+  padding: 0.3rem 0.45rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.answer a {
+  color: var(--teal);
+}
+
+.reading {
+  max-width: 42rem;
+  padding-top: 2rem;
 }

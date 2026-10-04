@@ -12,6 +12,8 @@ const batchEl = () => document.querySelector("#batch");
 const errorEl = () => document.querySelector("#error");
 const pendingEl = () => document.querySelector("#pending");
 const answerEl = () => document.querySelector("#answer");
+const actionsEl = () => document.querySelector("#actions");
+const savedEl = () => document.querySelector("#saved");
 const filesEl = () => document.querySelector("#files");
 const modelEl = () => document.querySelector("#model");
 const ctxEl = () => document.querySelector("#ctx");
@@ -91,6 +93,28 @@ function showError(msg) {
   const el = errorEl();
   el.hidden = !msg;
   el.textContent = msg || "";
+}
+
+function clearAnswer() {
+  answerEl().innerHTML = "";
+  actionsEl().hidden = true;
+  const saved = savedEl();
+  saved.hidden = true;
+  saved.textContent = "";
+  filesEl().replaceChildren();
+}
+
+function showAnswer(reply) {
+  answerEl().innerHTML = reply.html || "";
+  actionsEl().hidden = !reply.html;
+}
+
+function keepLinksInPage(article) {
+  article.addEventListener("click", (event) => {
+    if (event.target.closest("a")) {
+      event.preventDefault();
+    }
+  });
 }
 
 function render(view) {
@@ -206,14 +230,13 @@ window.addEventListener("DOMContentLoaded", () => {
     button.disabled = true;
     pendingEl().hidden = false;
     showError("");
-    answerEl().textContent = "";
-    filesEl().replaceChildren();
+    clearAnswer();
     try {
       const reply = await invoke("ask_question", {
         id,
         question: document.querySelector("#q").value,
       });
-      answerEl().textContent = reply.answer || "";
+      showAnswer(reply);
       for (const rel of reply.files || []) {
         const li = document.createElement("li");
         li.textContent = rel;
@@ -253,6 +276,42 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  document.querySelector("#open").addEventListener("click", async () => {
+    const id = packId();
+    if (id == null) {
+      return;
+    }
+    try {
+      await invoke("ask_open", { id });
+      showError("");
+    } catch (err) {
+      showError(String(err));
+    }
+  });
+
+  document.querySelector("#save").addEventListener("click", async () => {
+    const id = packId();
+    if (id == null) {
+      return;
+    }
+    const button = document.querySelector("#save");
+    button.disabled = true;
+    try {
+      const path = await invoke("ask_save", { id });
+      if (path) {
+        const saved = savedEl();
+        saved.hidden = false;
+        saved.textContent = `Enregistré : ${path}`;
+        showError("");
+      }
+    } catch (err) {
+      showError(String(err));
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  keepLinksInPage(answerEl());
   refresh();
   loadModels();
   setInterval(refresh, 800);

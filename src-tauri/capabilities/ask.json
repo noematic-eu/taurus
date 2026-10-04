@@ -9,6 +9,9 @@
     "allow-ask-remove",
     "allow-ask-question",
     "allow-ask-models",
-    "allow-ask-set-model"
+    "allow-ask-set-model",
+    "allow-ask-save",
+    "allow-ask-open",
+    "allow-ask-rendered"
   ]
 }

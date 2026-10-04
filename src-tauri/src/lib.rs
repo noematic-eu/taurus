@@ -38,6 +38,10 @@ impl Shutdown {
         if let Some(window) = self.app.get_webview_window(&self.ask_label) {
             let _ = window.close();
         }
+        let reply = format!("ask-reply-{}", self.id);
+        if let Some(window) = self.app.get_webview_window(&reply) {
+            let _ = window.close();
+        }
     }
 }
 
@@ -52,12 +56,14 @@ fn open_pack(app: &tauri::AppHandle, pack_path: PathBuf) -> Result<String, Strin
         server.stop();
         format!("url: {e}")
     })?;
-    let live = Arc::new(ask::LivePack::new(
+    let mut live = ask::LivePack::new(
         server.root.clone(),
         server.markdown,
         server.port,
         server.index.clone(),
-    ));
+    );
+    live.point_save_at(&pack_path);
+    let live = Arc::new(live);
     app.state::<ask::AskStore>().insert(id, live.clone());
 
     let nav = live.clone();
@@ -188,9 +194,23 @@ async fn ask_question(
     let pack = app.state::<ask::AskStore>().get(id)?;
     let host = ask::ollama_host();
     let model = ask::ollama_model();
-    tauri::async_runtime::spawn_blocking(move || pack.question(&question, &host, model.as_deref()))
-        .await
-        .map_err(|_| "Interrogation interrompue.".to_string())?
+    let reply = tauri::async_runtime::spawn_blocking(move || {
+        pack.question(&question, &host, model.as_deref())
+    })
+    .await
+    .map_err(|_| "Interrogation interrompue.".to_string())??;
+    refresh_reply(&app, id);
+    Ok(reply)
+}
+
+fn refresh_reply(app: &tauri::AppHandle, id: u64) {
+    let label = format!("ask-reply-{id}");
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = handle.get_webview_window(&label) {
+            let _ = window.eval("location.reload()");
+        }
+    });
 }
 
 #[tauri::command]
@@ -201,6 +221,78 @@ async fn ask_models(app: tauri::AppHandle, id: u64) -> Result<ask::ModelView, St
     tauri::async_runtime::spawn_blocking(move || pack.models(&host, preferred.as_deref()))
         .await
         .map_err(|_| "Interrogation interrompue.".to_string())?
+}
+
+#[tauri::command]
+async fn ask_save(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    id: u64,
+) -> Result<Option<String>, String> {
+    let pack = app.state::<ask::AskStore>().get(id)?;
+    let markdown = if window.label() == format!("ask-reply-{id}") {
+        pack.shown_markdown()?
+    } else {
+        pack.answer_text()?
+    };
+    let directory = pack.save_directory().to_path_buf();
+    let picked = pick_save_path(&app, &directory, "reponse.md")?;
+    let Some(file) = picked else {
+        return Ok(None);
+    };
+    let path = ask::markdown_save_path(file);
+    if pack.save_lands_in_temp(&path) {
+        return Err("Ce dossier est temporaire : il disparaît à la fermeture du pack.".to_string());
+    }
+    let mut text = markdown;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    std::fs::write(&path, text).map_err(|err| format!("Enregistrement impossible : {err}"))?;
+    Ok(Some(path.display().to_string()))
+}
+
+#[tauri::command]
+async fn ask_open(app: tauri::AppHandle, id: u64) -> Result<(), String> {
+    let pack = app.state::<ask::AskStore>().get(id)?;
+    pack.answer_text()?;
+    let title = pack
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("Réponse — {name}"))
+        .unwrap_or_else(|| "Réponse".to_string());
+    let label = format!("ask-reply-{id}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(open_reply_window(&handle, &label, title));
+    })
+    .map_err(|err| format!("fenêtre: {err}"))?;
+    rx.recv()
+        .map_err(|_| "Ouverture interrompue.".to_string())?
+}
+
+fn open_reply_window(app: &tauri::AppHandle, label: &str, title: String) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.eval("location.reload()");
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(app, label, WebviewUrl::App("reply.html".into()))
+        .title(title)
+        .inner_size(860.0, 920.0)
+        .build()
+        .map_err(|err| format!("fenêtre: {err}"))?;
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn ask_rendered(app: tauri::AppHandle, id: u64) -> Result<ask::AnswerPage, String> {
+    app.state::<ask::AskStore>().get(id)?.answer_page()
 }
 
 #[tauri::command]
@@ -251,7 +343,10 @@ pub fn run() {
             ask_remove,
             ask_question,
             ask_models,
-            ask_set_model
+            ask_set_model,
+            ask_save,
+            ask_open,
+            ask_rendered
         ])
         .setup(|app| {
             app.manage(ask::AskStore::default());
@@ -302,4 +397,91 @@ pub fn run() {
                 }
             },
         );
+}
+
+fn pick_save_path(
+    app: &tauri::AppHandle,
+    directory: &Path,
+    file_name: &str,
+) -> Result<Option<PathBuf>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return pick_save_path_macos(app, directory, file_name);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let picked = app
+            .dialog()
+            .file()
+            .set_title("Sauvegarder la réponse")
+            .set_directory(directory)
+            .set_file_name(file_name)
+            .add_filter("Markdown", &["md"])
+            .set_can_create_directories(true)
+            .blocking_save_file();
+        match picked {
+            None => Ok(None),
+            Some(file) => file
+                .into_path()
+                .map(Some)
+                .map_err(|_| "Chemin de sauvegarde illisible.".to_string()),
+        }
+    }
+}
+
+/// Le dossier et le nom sont posés à part : les réunir donne une URL qui n’existe pas.
+#[cfg(target_os = "macos")]
+fn pick_save_path_macos(
+    app: &tauri::AppHandle,
+    directory: &Path,
+    file_name: &str,
+) -> Result<Option<PathBuf>, String> {
+    let directory = directory.to_path_buf();
+    let file_name = file_name.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(present_save_panel(&directory, &file_name));
+    })
+    .map_err(|err| format!("fenêtre: {err}"))?;
+    rx.recv()
+        .map_err(|_| "Sauvegarde interrompue.".to_string())?
+}
+
+#[cfg(target_os = "macos")]
+fn present_save_panel(directory: &Path, file_name: &str) -> Result<Option<PathBuf>, String> {
+    use objc2::rc::autoreleasepool;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSModalResponseOK, NSSavePanel};
+    use objc2_foundation::{NSArray, NSString, NSURL};
+
+    autoreleasepool(|_| {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return Err("Sauvegarde hors du thread principal.".to_string());
+        };
+        let panel = NSSavePanel::savePanel(mtm);
+        panel.setMessage(Some(&NSString::from_str("Sauvegarder la réponse")));
+        panel.setCanCreateDirectories(true);
+        panel.setAllowsOtherFileTypes(true);
+        let ext = NSString::from_str("md");
+        let types = NSArray::from_slice(&[&*ext]);
+        #[allow(deprecated)]
+        panel.setAllowedFileTypes(Some(&types));
+        if directory.is_dir() {
+            if let Some(path) = directory.to_str() {
+                let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(path), true);
+                panel.setDirectoryURL(Some(&url));
+            }
+        }
+        panel.setNameFieldStringValue(&NSString::from_str(file_name));
+        if panel.runModal() != NSModalResponseOK {
+            return Ok(None);
+        }
+        let url = panel
+            .URL()
+            .ok_or_else(|| "Chemin de sauvegarde illisible.".to_string())?;
+        let path = url
+            .path()
+            .ok_or_else(|| "Chemin de sauvegarde illisible.".to_string())?;
+        Ok(Some(PathBuf::from(path.to_string())))
+    })
 }
