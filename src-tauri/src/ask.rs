@@ -4,6 +4,7 @@
 //! documents ne partent qu’avec la question, et uniquement vers l’hôte
 //! configuré. La liste des modèles et la taille de fenêtre sont lues avant.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -83,6 +84,10 @@ pub(crate) struct LivePack {
     choice_gen: Mutex<u64>,
     /// Zip servi sans extraction. Les lectures passent par le catalogue.
     zip: Option<Arc<crate::zip_pack::ZipPack>>,
+    /// Corpus sqlite. La page courante est un identifiant d’article, pas un fichier.
+    droit: Option<Arc<crate::droit::DroitPack>>,
+    /// Citation déjà lue pour un identifiant. Le sondage ne retourne pas dans la base.
+    labels: Mutex<HashMap<String, String>>,
 }
 
 impl LivePack {
@@ -109,11 +114,17 @@ impl LivePack {
             save_dir,
             choice_gen: Mutex::new(0),
             zip: None,
+            droit: None,
+            labels: Mutex::new(HashMap::new()),
         }
     }
 
     pub(crate) fn attach_zip(&mut self, zip: Arc<crate::zip_pack::ZipPack>) {
         self.zip = Some(zip);
+    }
+
+    pub(crate) fn attach_droit(&mut self, droit: Arc<crate::droit::DroitPack>) {
+        self.droit = Some(droit);
     }
 
     /// Une archive s’enregistre à côté du fichier, pas dans l’extraction.
@@ -167,10 +178,17 @@ impl LivePack {
         if !is_pack_origin(url, self.port) {
             return;
         }
-        let path = url.path().to_string();
+        let mut path = url.path().to_string();
+        if let Some(query) = url.query() {
+            if !query.is_empty() {
+                path.push('?');
+                path.push_str(query);
+            }
+        }
         if let Some(rel) = self.locate(&path) {
             *lock(&self.last_path) = Some(path);
-            *lock(&self.current) = Some(rel);
+            *lock(&self.current) = Some(rel.clone());
+            self.remember_label(&rel);
             return;
         }
         // L'index Markdown n'est pas encore prêt : on garde l'URL pour la
@@ -181,6 +199,12 @@ impl LivePack {
     }
 
     pub(crate) fn resolved_current(&self) -> Option<String> {
+        // Déjà résolu à la navigation : le sondage ne relance pas la requête.
+        if self.droit.is_some() {
+            if let Some(rel) = lock(&self.current).clone() {
+                return Some(rel);
+            }
+        }
         let path = lock(&self.last_path).clone();
         if let Some(path) = path {
             if let Some(rel) = self.locate(&path) {
@@ -192,9 +216,11 @@ impl LivePack {
     }
 
     pub(crate) fn view(&self) -> AskView {
+        let current = self.resolved_current();
+        let batch = lock(&self.batch).clone();
         AskView {
-            current: self.resolved_current(),
-            batch: lock(&self.batch).clone(),
+            current: current.as_deref().map(|key| self.display_key(key)),
+            batch: batch.iter().map(|key| self.display_key(key)).collect(),
             model: lock(&self.model).clone(),
             context_tokens: *lock(&self.context_tokens),
             prompt_tokens: *lock(&self.prompt_tokens),
@@ -290,7 +316,16 @@ impl LivePack {
     }
 
     pub(crate) fn remove(&self, rel: &str) -> AskView {
-        lock(&self.batch).retain(|p| p != rel);
+        let keys = lock(&self.batch).clone();
+        let target = keys
+            .into_iter()
+            .find(|key| key == rel || self.display_key(key) == rel);
+        if let Some(target) = target {
+            let mut batch = lock(&self.batch);
+            if let Some(pos) = batch.iter().position(|key| key == &target) {
+                batch.remove(pos);
+            }
+        }
         self.view()
     }
 
@@ -305,11 +340,23 @@ impl LivePack {
         let rels = pages_to_send(&batch, current.as_deref())?;
         let mut docs = Vec::with_capacity(rels.len());
         for rel in &rels {
-            let text = self.document(rel)?;
-            docs.push((rel.clone(), text));
+            if self.droit.is_some() {
+                docs.push(self.passage(rel)?);
+            } else {
+                docs.push((rel.clone(), self.document(rel)?));
+            }
         }
         let question = normalize_question(question);
-        let user = user_message(&docs, &question);
+        let user = if self.droit.is_some() {
+            cited_user_message(&docs, &question)
+        } else {
+            user_message(&docs, &question)
+        };
+        let system = if self.droit.is_some() {
+            crate::droit::SYSTEM_PROMPT
+        } else {
+            SYSTEM_PROMPT
+        };
         let selected = lock(&self.model)
             .clone()
             .filter(|name| !name.trim().is_empty());
@@ -320,7 +367,7 @@ impl LivePack {
             pick_installed(&names, None, model)
                 .ok_or_else(|| "Aucun modèle Ollama n’est installé.".to_string())?
         };
-        let (answer, prompt_tokens) = post_chat(host, &model, &user)?;
+        let (answer, prompt_tokens) = post_chat(host, &model, system, &user)?;
         let loaded = running_context(host, &model);
         // Le choix a pu changer pendant la question.
         let current = lock(&self.model).clone();
@@ -342,7 +389,7 @@ impl LivePack {
         Ok(AskReply {
             answer,
             html,
-            files: rels,
+            files: rels.iter().map(|rel| self.display_key(rel)).collect(),
             prompt_tokens: still.then_some(prompt_tokens).flatten(),
             context_tokens: *lock(&self.context_tokens),
         })
@@ -479,13 +526,53 @@ pub(crate) fn is_pack_origin(url: &tauri::Url, port: u16) -> bool {
 
 impl LivePack {
     fn locate(&self, url_path: &str) -> Option<String> {
+        if let Some(droit) = &self.droit {
+            return droit.locate(url_path);
+        }
         if let Some(zip) = &self.zip {
             return zip.locate(url_path, self.markdown, self.index.get());
         }
         source_of(&self.root, self.markdown, self.index.get(), url_path)
     }
 
+    fn remember_label(&self, key: &str) {
+        let Some(droit) = &self.droit else {
+            return;
+        };
+        if lock(&self.labels).contains_key(key) {
+            return;
+        }
+        if let Ok(citation) = droit.cite(key) {
+            lock(&self.labels).insert(key.to_string(), citation);
+        }
+    }
+
+    fn display_key(&self, key: &str) -> String {
+        if self.droit.is_some() {
+            if let Some(label) = lock(&self.labels).get(key).cloned() {
+                return label;
+            }
+            if let Some(droit) = &self.droit {
+                if let Ok(citation) = droit.cite(key) {
+                    lock(&self.labels).insert(key.to_string(), citation.clone());
+                    return citation;
+                }
+            }
+        }
+        key.to_string()
+    }
+
+    fn passage(&self, id: &str) -> Result<(String, String), String> {
+        let Some(droit) = &self.droit else {
+            return Err("Article introuvable.".into());
+        };
+        droit.passage(id)
+    }
+
     pub(crate) fn document(&self, rel: &str) -> Result<String, String> {
+        if let Some(droit) = &self.droit {
+            return Ok(droit.passage(rel)?.1);
+        }
         if let Some(zip) = &self.zip {
             let text = zip.load_text(rel)?;
             if self.markdown {
@@ -545,12 +632,21 @@ pub(crate) fn normalize_question(question: &str) -> String {
 }
 
 pub(crate) fn user_message(docs: &[(String, String)], question: &str) -> String {
+    message("## fichier: ", docs, question)
+}
+
+/// Même enveloppe que `user_message`, avec la citation juridique à la place du nom de fichier.
+pub(crate) fn cited_user_message(docs: &[(String, String)], question: &str) -> String {
+    message("## ", docs, question)
+}
+
+fn message(header: &str, docs: &[(String, String)], question: &str) -> String {
     let mut out = String::from("Documents :\n");
-    for (rel, text) in docs {
+    for (name, text) in docs {
         let (text, cut) = truncate_chars(text, DOC_CHARS);
         out.push('\n');
-        out.push_str("## fichier: ");
-        out.push_str(rel);
+        out.push_str(header);
+        out.push_str(name);
         out.push_str("\n\n");
         out.push_str(&text);
         if cut {
@@ -746,7 +842,12 @@ fn running_context(host: &str, model: &str) -> Option<u64> {
     })
 }
 
-fn post_chat(host: &str, model: &str, user: &str) -> Result<(String, Option<u64>), String> {
+fn post_chat(
+    host: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+) -> Result<(String, Option<u64>), String> {
     // Pas d’options.num_ctx : la fenêtre est affichée, pas agrandie.
     // Le flux garde la connexion active pendant la génération. think false
     // demande la réponse sans la trace de raisonnement, qui dépassait le délai.
@@ -755,7 +856,7 @@ fn post_chat(host: &str, model: &str, user: &str) -> Result<(String, Option<u64>
         "stream": true,
         "think": false,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": user}
         ]
     });

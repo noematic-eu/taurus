@@ -1,8 +1,8 @@
 //! Servir un pack web en HTTP local (sans API Tauri).
 //!
 //! Un dossier de site est servi sur place. Un zip est lu par son catalogue,
-//! sans extraction. Un WACZ est extrait dans un dossier temporaire, supprimé
-//! à l’arrêt du serveur.
+//! sans extraction. Un fichier `.sqlite` de corpus est lu en place. Un WACZ
+//! est extrait dans un dossier temporaire, supprimé à l’arrêt du serveur.
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use tiny_http::{Header, Response, Server, StatusCode};
 
+use crate::droit::DroitPack;
 use crate::progress::{self, Reporter};
 use crate::zip_pack::ZipPack;
 
@@ -30,6 +31,8 @@ pub struct PackServer {
     pub index: Arc<OnceLock<crate::md::MdIndex>>,
     /// Présent quand le pack est un zip servi sans extraction. `root` est alors le fichier zip.
     pub zip: Option<Arc<ZipPack>>,
+    /// Présent quand le pack est un corpus sqlite. `root` est alors le fichier.
+    pub droit: Option<Arc<DroitPack>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -52,6 +55,7 @@ impl PackServer {
             temp,
             markdown,
             zip,
+            droit,
             index: built,
         } = prepare_with(&pack_path, progress)?;
 
@@ -68,10 +72,11 @@ impl PackServer {
         let index_t = index.clone();
         let root_t = root.clone();
         let zip_t = zip.clone();
+        let droit_t = droit.clone();
         thread::Builder::new()
             .name(format!("taurus-{port}"))
             .spawn(move || {
-                serve(server, root_t, stop_t, markdown, index_t, zip_t);
+                serve(server, root_t, stop_t, markdown, index_t, zip_t, droit_t);
                 drop(temp);
             })
             .map_err(|e| format!("thread: {e}"))?;
@@ -84,6 +89,7 @@ impl PackServer {
             markdown,
             index,
             zip,
+            droit,
             stop,
         })
     }
@@ -112,6 +118,12 @@ pub(crate) fn is_zip(p: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
 }
 
+pub(crate) fn is_sqlite(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("sqlite"))
+}
+
 /// Dossier, archive, ou zip que l’accueil peut ouvrir.
 pub(crate) fn is_openable(path: &Path) -> bool {
     if path.is_dir() {
@@ -119,7 +131,7 @@ pub(crate) fn is_openable(path: &Path) -> bool {
             || find_archive_in_dir(path).is_some()
             || crate::md::contains_markdown(path)
     } else {
-        is_web_archive(path) || is_zip(path)
+        is_web_archive(path) || is_zip(path) || is_sqlite(path)
     }
 }
 
@@ -159,6 +171,7 @@ struct Prepared {
     temp: Option<tempfile::TempDir>,
     markdown: bool,
     zip: Option<Arc<ZipPack>>,
+    droit: Option<Arc<DroitPack>>,
     /// Index Markdown déjà construit, pour ne pas le refaire au premier GET.
     index: Option<crate::md::MdIndex>,
 }
@@ -173,6 +186,7 @@ fn prepare_with(path: &Path, progress: &Reporter) -> Result<Prepared, String> {
                 temp: None,
                 markdown: false,
                 zip: None,
+                droit: None,
                 index: None,
             });
         }
@@ -190,6 +204,7 @@ fn prepare_with(path: &Path, progress: &Reporter) -> Result<Prepared, String> {
                 temp: None,
                 markdown: true,
                 zip: None,
+                droit: None,
                 index: Some(built),
             });
         }
@@ -209,6 +224,7 @@ fn prepare_with(path: &Path, progress: &Reporter) -> Result<Prepared, String> {
             temp: Some(dir),
             markdown: false,
             zip: None,
+            droit: None,
             index: None,
         });
     }
@@ -227,10 +243,23 @@ fn prepare_with(path: &Path, progress: &Reporter) -> Result<Prepared, String> {
             temp: None,
             markdown,
             zip: Some(Arc::new(pack)),
+            droit: None,
             index,
         });
     }
-    Err("Dossier de site, .zip, .wacz ou .warc attendu.".into())
+    if is_sqlite(path) {
+        let pack = DroitPack::open(path, progress)?;
+        return Ok(Prepared {
+            root: path.to_path_buf(),
+            entry: String::new(),
+            temp: None,
+            markdown: false,
+            zip: None,
+            droit: Some(Arc::new(pack)),
+            index: None,
+        });
+    }
+    Err("Dossier de site, .zip, .wacz, .warc ou .sqlite de corpus attendu.".into())
 }
 
 pub(crate) fn find_archive_in_dir(dir: &Path) -> Option<PathBuf> {
@@ -459,8 +488,9 @@ fn serve(
     markdown: bool,
     index: Arc<OnceLock<crate::md::MdIndex>>,
     zip: Option<Arc<ZipPack>>,
+    droit: Option<Arc<DroitPack>>,
 ) {
-    if markdown && index.get().is_none() {
+    if markdown && index.get().is_none() && droit.is_none() {
         let built = if let Some(zip) = &zip {
             zip.md_index()
         } else {
@@ -474,6 +504,11 @@ fn serve(
             Ok(Some(r)) => r,
             Ok(None) | Err(_) => continue,
         };
+
+        if let Some(droit) = &droit {
+            droit.respond(req);
+            continue;
+        }
 
         if let Some(zip) = &zip {
             if let Some(index) = &md_index {
@@ -497,8 +532,22 @@ fn serve(
             continue;
         }
 
-        let url_path = req.url().split('?').next().unwrap_or("/");
-        let rel = url_path.trim_start_matches('/');
+        // Le zip décode déjà l’URL. Un dossier doit le faire aussi : le lecteur
+        // encode les espaces et les « & » des noms (`%20`, `%26`).
+        let url_path = req.url().split(['?', '#']).next().unwrap_or("/");
+        let decoded = crate::md::percent_decode(url_path);
+        let rel = decoded.trim_start_matches('/').trim_end_matches('/');
+        if !rel.is_empty()
+            && (rel.contains('\0')
+                || rel.contains('\\')
+                || rel
+                    .split('/')
+                    .any(|seg| seg.is_empty() || seg == "." || seg == ".."))
+        {
+            let _ =
+                req.respond(Response::from_string("interdit").with_status_code(StatusCode(403)));
+            continue;
+        }
         let Some(joined) = resolve_served_path(&root, rel) else {
             let _ =
                 req.respond(Response::from_string("introuvable").with_status_code(StatusCode(404)));
@@ -691,6 +740,43 @@ mod tests {
         server.stop();
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(std::fs::read_to_string(&index).unwrap(), "v2");
+    }
+
+    #[test]
+    fn static_folder_decodes_percent_encoded_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), b"home").unwrap();
+        std::fs::write(dir.path().join("A B.html"), b"space").unwrap();
+        std::fs::write(dir.path().join("A&B.html"), b"amp").unwrap();
+        std::fs::write(dir.path().join("A&Eacute;NIEN.html"), b"entity").unwrap();
+        std::fs::write(dir.path().join("café.html"), b"accent").unwrap();
+        let server = PackServer::open(dir.path()).unwrap();
+
+        let (status, body) = http_get(server.port, "/");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "home");
+
+        let (status, body) = http_get(server.port, "/A%20B.html");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "space");
+
+        let (status, body) = http_get(server.port, "/A%26B.html");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "amp");
+
+        let (status, body) = http_get(server.port, "/A%26Eacute%3BNIEN.html");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "entity");
+
+        let (status, body) = http_get(server.port, "/caf%C3%A9.html");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "accent");
+
+        let (status, body) = http_get(server.port, "/%2e%2e%2fsecret");
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(body, "interdit");
+
+        server.stop();
     }
 
     #[test]
