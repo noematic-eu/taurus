@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>A desktop player for zipped static websites and WACZ web archives.</strong><br />
+  <strong>A desktop player for a site folder, a zip, or a WACZ web archive.</strong><br />
   The archive changes; the app does not.
 </p>
 
@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/version-0.2.0-1e3a4c.svg" alt="Version 0.2.0" />
 </p>
 
-Taurus opens a `.zip` (static site: `OUVRIR.html` or `index.html`) or a `.wacz` web archive in its own window. Course packs, Manning liveBooks, lab materials — the content lives in the archive, not in the binary.
+Taurus opens a site folder, a `.zip` (static site: `OUVRIR.html` or `index.html`), or a `.wacz` web archive in its own window. Course packs, Manning liveBooks, lab materials — the content lives in the folder or the archive, not in the binary.
 
 Built with [Tauri 2](https://tauri.app/). The name is a pun on the framework; Taurus is the app, not Tauri.
 
@@ -27,19 +27,21 @@ Built with [Tauri 2](https://tauri.app/). The name is a pun on the framework; Ta
 
 ### What it does
 
-Drop a zip or WACZ, pick one from the file dialog, pass a path on the command line, or double-click / drop it on the app icon (bundled app, via macOS file associations). Taurus:
+Drop a folder, zip, or WACZ, pick one from the file dialog, pass a path on the command line, double-click an archive, or drop a folder or an archive on the app icon (bundled app, via macOS file associations). Taurus:
 
-1. Extracts the archive to a temporary folder (WACZ: WARC records become HTML + `figures/`)
+1. Serves a folder in place. A zip or WACZ is extracted to a temporary folder (WACZ: WARC records become HTML + `figures/`)
 2. Finds the entry page (`OUVRIR.html`, `ouvrir.html`, `index.html`, or `index.htm`)
 3. Serves the files over HTTP on `127.0.0.1`
 4. Opens a dedicated window on that local URL
-5. Stops the server and deletes the temp files when the window closes
+5. Stops the server when the window closes, and deletes the temp files of an extracted archive. A folder you opened is left untouched
 
-Several packs can be open at once. Updating a course means shipping a new zip, not a new installer.
+Several packs can be open at once. While you write category pages and indexes, open the folder: each save shows up on reload, with no zip to rebuild. Shipping a course is still a new zip, not a new installer.
+
+A folder that already has an entry page is served as itself, even if a `.zip` or `.wacz` sits next to it. A folder with no entry page is treated as a Browsertrix collection: Taurus opens the `.wacz` or `.warc` inside. A single wrapper directory (one subfolder, no files) is unwrapped, same as a zip.
 
 ### Pack format
 
-A pack is a zip of a static website, or a [WACZ](https://specs.webrecorder.net/wacz/latest/) (ISO WARC inside a zip). CloudFront figure URLs in Manning liveBooks are rewritten to local `figures/` files so the book works offline.
+A pack is a folder of a static website, a zip of that website, a [WACZ](https://specs.webrecorder.net/wacz/latest/) (ISO WARC inside a zip), or a folder of Markdown notes. CloudFront figure URLs in Manning liveBooks are rewritten to local `figures/` files so the book works offline. A Markdown folder (no entry page) opens as a reader: search by file name, each note rendered to HTML. Links written as `/page/Slug` open the local `Slug_grokipedia.md`, or `Slug_wikipedia.md` if that is the only copy. Markdown files sitting inside an HTML site are still served as text.
 
 ```text
 course.zip
@@ -64,7 +66,7 @@ The pack HTML, CSS, and JavaScript run as a normal website. They have **no acces
 |---|---|
 | Isolation | Pack windows (`pack-*`) have an empty capability set |
 | Loopback only | HTTP server binds to `127.0.0.1`, never the LAN |
-| Path traversal | Requests outside the extracted root are rejected |
+| Path traversal | Requests outside the served root are rejected |
 | Headers | `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` |
 
 Taurus is a viewer, not a sandbox for untrusted code. Treat a zip like a website you chose to open.
@@ -87,9 +89,10 @@ npm install
 npm run tauri dev
 ```
 
-Pass zip or WACZ paths as arguments to open them on launch:
+Pass a site folder, a zip, or a WACZ as an argument to open it on launch:
 
 ```bash
+npm run tauri dev -- -- /path/to/site
 npm run tauri dev -- -- /path/to/pack.zip
 npm run tauri dev -- -- ~/kb/html/manning/_archives/a-simple-guide-to-retrieval-augmented-generation/a-simple-guide-to-retrieval-augmented-generation.wacz
 ```
@@ -130,7 +133,8 @@ Current lockfiles have **no known vulnerabilities**. Documented exceptions in `d
 
 ### Limitations
 
-- Content must already be HTML. Markdown packs are not rendered.
+- A folder of Markdown notes is rendered (search by file name). Markdown next to an `index.html` or `OUVRIR.html` is still served as text.
+- Opening a folder reads it live. Closing the window does not delete that folder.
 - One native binary per OS; there is no portable “just a zip of the player”.
 - Linux is supported at the Tauri level but not built in CI yet.
 
@@ -144,19 +148,21 @@ Current lockfiles have **no known vulnerabilities**. Documented exceptions in `d
 
 ### À quoi ça sert
 
-Glissez un zip ou un `.wacz`, choisissez-le dans le dialogue, passez un chemin en ligne de commande, ou double-cliquez / déposez-le sur l’icône de l’app (app packagée, associations de fichiers macOS). Taurus :
+Glissez un dossier, un zip ou un `.wacz`, choisissez-le dans le dialogue, passez un chemin en ligne de commande, double-cliquez une archive, ou déposez un dossier ou une archive sur l’icône de l’app (app packagée, associations de fichiers macOS). Taurus :
 
-1. extrait l’archive dans un dossier temporaire (WACZ : enregistrements WARC → HTML + `figures/`) ;
+1. sert un dossier sur place. Un zip ou un WACZ est extrait dans un dossier temporaire (WACZ : enregistrements WARC → HTML + `figures/`) ;
 2. trouve la page d’entrée (`OUVRIR.html`, `ouvrir.html`, `index.html` ou `index.htm`) ;
 3. sert les fichiers en HTTP sur `127.0.0.1` ;
 4. ouvre une fenêtre dédiée sur cette URL locale ;
-5. arrête le serveur et supprime les fichiers temporaires à la fermeture de la fenêtre.
+5. arrête le serveur à la fermeture de la fenêtre, et supprime les fichiers temporaires d’une archive extraite. Un dossier ouvert n’est pas touché.
 
-Plusieurs packs peuvent être ouverts en même temps. Mettre à jour un cours, c’est envoyer un nouveau zip — pas un nouvel installeur.
+Plusieurs packs peuvent être ouverts en même temps. Pour écrire les pages de catégories et l’index, ouvrez le dossier : chaque enregistrement apparaît au rechargement, sans reconstruire de zip. Publier un cours reste un nouveau zip — pas un nouvel installeur.
+
+Un dossier qui a déjà une page d’entrée est servi tel quel, même s’il contient aussi un `.zip` ou un `.wacz`. Sans page d’entrée, il est traité comme une collection Browsertrix : Taurus ouvre le `.wacz` ou le `.warc` qu’il contient. Un dossier enveloppe unique (un seul sous-dossier, aucun fichier) est déroulé, comme pour un zip.
 
 ### Format d’un pack
 
-Un pack est un zip de site statique, ou une archive [WACZ](https://specs.webrecorder.net/wacz/latest/) (WARC ISO dans un zip). Les URL CloudFront des figures Manning sont réécrits vers `figures/` pour la lecture hors-ligne.
+Un pack est un dossier de site statique, un zip de ce site, une archive [WACZ](https://specs.webrecorder.net/wacz/latest/) (WARC ISO dans un zip), ou un dossier de notes Markdown. Les URL CloudFront des figures Manning sont réécrits vers `figures/` pour la lecture hors-ligne. Un dossier Markdown (sans page d’entrée) s’ouvre comme un lecteur : recherche sur le nom du fichier, chaque note rendue en HTML. Les liens `/page/Slug` ouvrent le fichier local `Slug_grokipedia.md`, ou `Slug_wikipedia.md` s’il n’y a que celui-là. Les fichiers Markdown à l’intérieur d’un site HTML restent servis comme du texte.
 
 ```text
 cours.zip
@@ -181,7 +187,7 @@ Le HTML, le CSS et le JavaScript du pack s’exécutent comme un site web normal
 |---|---|
 | Isolation | Les fenêtres de pack (`pack-*`) n’ont aucune capability |
 | Boucle locale | Le serveur HTTP écoute `127.0.0.1`, jamais le réseau local |
-| Traversée de chemin | Toute requête hors de la racine extraite est refusée |
+| Traversée de chemin | Toute requête hors de la racine servie est refusée |
 | En-têtes | `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` |
 
 Taurus est un lecteur, pas un bac à sable pour du code non fiable. Un zip se traite comme un site que l’on a choisi d’ouvrir.
@@ -204,9 +210,10 @@ npm install
 npm run tauri dev
 ```
 
-Passez des chemins de zip ou de WACZ en arguments pour les ouvrir au lancement :
+Passez un dossier de site, un zip ou un WACZ en argument pour l’ouvrir au lancement :
 
 ```bash
+npm run tauri dev -- -- /chemin/vers/site
 npm run tauri dev -- -- /chemin/vers/pack.zip
 npm run tauri dev -- -- ~/kb/html/manning/_archives/a-simple-guide-to-retrieval-augmented-generation/a-simple-guide-to-retrieval-augmented-generation.wacz
 ```
@@ -247,7 +254,8 @@ Les lockfiles actuels n’ont **aucune vulnérabilité connue**. Exceptions docu
 
 ### Limites
 
-- Le contenu doit déjà être du HTML. Les packs Markdown ne sont pas rendus.
+- Un dossier de notes Markdown est rendu (recherche sur le nom du fichier). Un Markdown à côté d’un `index.html` ou `OUVRIR.html` reste servi comme du texte.
+- Ouvrir un dossier le lit en direct. Fermer la fenêtre ne supprime pas ce dossier.
 - Un binaire natif par OS ; il n’existe pas de lecteur « juste un zip ».
 - Linux est géré au niveau Tauri, mais pas encore construit en CI.
 

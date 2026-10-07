@@ -10,6 +10,10 @@ function showError(msg) {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  document.querySelector("#pick-folder").addEventListener("click", () => {
+    invoke("pick_folder").catch((e) => showError(String(e)));
+  });
+
   document.querySelector("#pick").addEventListener("click", () => {
     invoke("pick_pack").catch((e) => showError(String(e)));
   });

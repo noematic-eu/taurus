@@ -13,7 +13,7 @@
         "label": "main",
         "title": "Taurus",
         "width": 560,
-        "height": 420
+        "height": 540
       }
     ],
     "security": {
@@ -47,6 +47,13 @@
         "name": "WARC web archive",
         "mimeType": "application/warc",
         "role": "Viewer"
+      },
+      {
+        "ext": [],
+        "name": "Site folder",
+        "role": "Viewer",
+        "rank": "None",
+        "contentTypes": ["public.folder"]
       }
     ]
   }
