@@ -1,7 +1,9 @@
 mod ask;
 mod md;
 mod pack;
+mod progress;
 mod wacz;
+mod zip_pack;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,6 +15,7 @@ use tauri::{DragDropEvent, Emitter, WebviewUrl, WebviewWindowBuilder, WindowEven
 use tauri_plugin_dialog::DialogExt;
 
 static PACK_ID: AtomicU64 = AtomicU64::new(1);
+static OPEN_GEN: AtomicU64 = AtomicU64::new(1);
 
 struct Shutdown {
     once: AtomicBool,
@@ -45,8 +48,51 @@ impl Shutdown {
     }
 }
 
-fn open_pack(app: &tauri::AppHandle, pack_path: PathBuf) -> Result<String, String> {
-    let server = Arc::new(PackServer::open(&pack_path)?);
+/// Prépare le pack hors du thread principal et publie la progression sur l’accueil.
+fn begin_open(app: &tauri::AppHandle, pack_path: PathBuf) {
+    let app = app.clone();
+    let gen = OPEN_GEN.fetch_add(1, Ordering::SeqCst);
+    let worker = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("taurus-open".into())
+        .spawn(move || {
+            let emit = worker.clone();
+            let progress = progress::Reporter::new(gen, move |event| {
+                let _ = emit.emit("taurus-progress", event);
+            });
+            progress.force("Ouverture…", None, String::new());
+            let opened = PackServer::open_with(&pack_path, &progress);
+            let present = worker.clone();
+            if worker
+                .run_on_main_thread(move || {
+                    match opened {
+                        Ok(server) => {
+                            if let Err(err) = present_pack(&present, pack_path, Arc::new(server)) {
+                                let _ = present.emit("taurus-error", err);
+                            }
+                        }
+                        Err(err) => {
+                            let _ = present.emit("taurus-error", err);
+                        }
+                    }
+                    let _ = present.emit("taurus-progress", progress::OpenProgress::finished(gen));
+                })
+                .is_err()
+            {
+                let _ = worker.emit("taurus-error", "Ouverture interrompue.");
+                let _ = worker.emit("taurus-progress", progress::OpenProgress::finished(gen));
+            }
+        });
+    if spawned.is_err() {
+        let _ = app.emit("taurus-error", "Ouverture interrompue.");
+    }
+}
+
+fn present_pack(
+    app: &tauri::AppHandle,
+    pack_path: PathBuf,
+    server: Arc<PackServer>,
+) -> Result<String, String> {
     let url = server.url();
     let title = format!("Taurus — {}", server.title);
     let id = PACK_ID.fetch_add(1, Ordering::SeqCst);
@@ -63,6 +109,9 @@ fn open_pack(app: &tauri::AppHandle, pack_path: PathBuf) -> Result<String, Strin
         server.index.clone(),
     );
     live.point_save_at(&pack_path);
+    if let Some(zip) = &server.zip {
+        live.attach_zip(Arc::clone(zip));
+    }
     let live = Arc::new(live);
     app.state::<ask::AskStore>().insert(id, live.clone());
 
@@ -143,9 +192,7 @@ fn pick_pack(app: tauri::AppHandle) {
                 return;
             };
             let path = PathBuf::from(path.to_string());
-            if let Err(e) = open_pack(&app, path) {
-                let _ = app.emit("taurus-error", e);
-            }
+            begin_open(&app, path);
         });
 }
 
@@ -158,16 +205,13 @@ fn pick_folder(app: tauri::AppHandle) {
             let Some(path) = folder else {
                 return;
             };
-            let path = PathBuf::from(path.to_string());
-            if let Err(e) = open_pack(&app, path) {
-                let _ = app.emit("taurus-error", e);
-            }
+            begin_open(&app, PathBuf::from(path.to_string()));
         });
 }
 
 #[tauri::command]
-fn open_pack_path(app: tauri::AppHandle, path: String) -> Result<String, String> {
-    open_pack(&app, PathBuf::from(path))
+fn open_pack_path(app: tauri::AppHandle, path: String) {
+    begin_open(&app, PathBuf::from(path));
 }
 
 #[tauri::command]
@@ -311,9 +355,7 @@ async fn ask_set_model(
 fn drop_packs(app: &tauri::AppHandle, paths: &[PathBuf]) {
     for p in paths {
         if is_pack(p) {
-            if let Err(e) = open_pack(app, p.clone()) {
-                let _ = app.emit("taurus-error", e);
-            }
+            begin_open(app, p.clone());
         } else {
             let _ = app.emit(
                 "taurus-error",
@@ -363,9 +405,7 @@ pub fn run() {
             let handle = app.handle().clone();
             for p in args {
                 if is_pack(&p) {
-                    if let Err(e) = open_pack(&handle, p) {
-                        let _ = handle.emit("taurus-error", e);
-                    }
+                    begin_open(&handle, p);
                 }
             }
             Ok(())

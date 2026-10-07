@@ -1,7 +1,8 @@
 //! Servir un pack web en HTTP local (sans API Tauri).
 //!
-//! Un dossier de site est servi sur place. Un zip ou un WACZ est extrait
-//! dans un dossier temporaire, supprimé à l’arrêt du serveur.
+//! Un dossier de site est servi sur place. Un zip est lu par son catalogue,
+//! sans extraction. Un WACZ est extrait dans un dossier temporaire, supprimé
+//! à l’arrêt du serveur.
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -14,6 +15,9 @@ use std::time::Duration;
 
 use tiny_http::{Header, Response, Server, StatusCode};
 
+use crate::progress::{self, Reporter};
+use crate::zip_pack::ZipPack;
+
 const ENTRY_NAMES: &[&str] = &["OUVRIR.html", "ouvrir.html", "index.html", "index.htm"];
 
 pub struct PackServer {
@@ -24,11 +28,18 @@ pub struct PackServer {
     pub markdown: bool,
     /// Rempli par le thread du serveur avant d’accepter les requêtes, si le pack est Markdown.
     pub index: Arc<OnceLock<crate::md::MdIndex>>,
+    /// Présent quand le pack est un zip servi sans extraction. `root` est alors le fichier zip.
+    pub zip: Option<Arc<ZipPack>>,
     stop: Arc<AtomicBool>,
 }
 
 impl PackServer {
+    #[cfg(test)]
     pub fn open(pack_path: &Path) -> Result<Self, String> {
+        Self::open_with(pack_path, &Reporter::silent())
+    }
+
+    pub fn open_with(pack_path: &Path, progress: &Reporter) -> Result<Self, String> {
         let pack_path = resolve_input(pack_path)?;
         let title = pack_path
             .file_stem()
@@ -40,7 +51,9 @@ impl PackServer {
             entry,
             temp,
             markdown,
-        } = prepare(&pack_path)?;
+            zip,
+            index: built,
+        } = prepare_with(&pack_path, progress)?;
 
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind: {e}"))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -49,12 +62,16 @@ impl PackServer {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
         let index = Arc::new(OnceLock::new());
+        if let Some(built) = built {
+            let _ = index.set(built);
+        }
         let index_t = index.clone();
         let root_t = root.clone();
+        let zip_t = zip.clone();
         thread::Builder::new()
             .name(format!("taurus-{port}"))
             .spawn(move || {
-                serve(server, root_t, stop_t, markdown, index_t);
+                serve(server, root_t, stop_t, markdown, index_t, zip_t);
                 drop(temp);
             })
             .map_err(|e| format!("thread: {e}"))?;
@@ -66,6 +83,7 @@ impl PackServer {
             root,
             markdown,
             index,
+            zip,
             stop,
         })
     }
@@ -140,10 +158,13 @@ struct Prepared {
     entry: String,
     temp: Option<tempfile::TempDir>,
     markdown: bool,
+    zip: Option<Arc<ZipPack>>,
+    /// Index Markdown déjà construit, pour ne pas le refaire au premier GET.
+    index: Option<crate::md::MdIndex>,
 }
 
 /// Prépare la racine servie. `TempDir` n’est présent que pour une archive extraite.
-fn prepare(path: &Path) -> Result<Prepared, String> {
+fn prepare_with(path: &Path, progress: &Reporter) -> Result<Prepared, String> {
     if path.is_dir() {
         if let Ok((root, entry)) = site_root(path) {
             return Ok(Prepared {
@@ -151,14 +172,25 @@ fn prepare(path: &Path) -> Result<Prepared, String> {
                 entry,
                 temp: None,
                 markdown: false,
+                zip: None,
+                index: None,
             });
         }
         if crate::md::contains_markdown(path) {
+            let root = crate::md::markdown_root(path);
+            let mut notes = 0u64;
+            let built = crate::md::MdIndex::build_with(&root, &mut |count| {
+                notes = count;
+                progress.tick("Index des notes", count, None, progress::notes(count));
+            });
+            progress.force("Index des notes", None, progress::notes(notes));
             return Ok(Prepared {
-                root: crate::md::markdown_root(path),
+                root,
                 entry: "index.html".into(),
                 temp: None,
                 markdown: true,
+                zip: None,
+                index: Some(built),
             });
         }
         return Err(
@@ -167,6 +199,7 @@ fn prepare(path: &Path) -> Result<Prepared, String> {
         );
     }
     if is_web_archive(path) {
+        progress.force("Extraction…", None, String::new());
         let dir = tempfile::tempdir().map_err(|e| format!("temp: {e}"))?;
         let site = crate::wacz::materialize(path, dir.path())?;
         let (root, entry) = site_root(&site)?;
@@ -175,17 +208,26 @@ fn prepare(path: &Path) -> Result<Prepared, String> {
             entry,
             temp: Some(dir),
             markdown: false,
+            zip: None,
+            index: None,
         });
     }
     if is_zip(path) {
-        let dir = tempfile::tempdir().map_err(|e| format!("temp: {e}"))?;
-        unzip(path, dir.path())?;
-        let (root, entry) = site_root(dir.path())?;
+        let pack = ZipPack::open_with(path, progress)?;
+        let entry = pack.entry.clone();
+        let markdown = pack.markdown;
+        let index = if markdown {
+            Some(pack.md_index_with(progress))
+        } else {
+            None
+        };
         return Ok(Prepared {
-            root,
+            root: path.to_path_buf(),
             entry,
-            temp: Some(dir),
-            markdown: false,
+            temp: None,
+            markdown,
+            zip: Some(Arc::new(pack)),
+            index,
         });
     }
     Err("Dossier de site, .zip, .wacz ou .warc attendu.".into())
@@ -386,7 +428,7 @@ fn site_root_at(
     Err("Pas de OUVRIR.html ni index.html.".into())
 }
 
-fn content_type(path: &Path) -> String {
+pub(crate) fn content_type(path: &Path) -> String {
     let guessed = mime_guess::from_path(path).first_or_octet_stream();
     let essence = guessed.essence_str();
     let ext = path
@@ -416,9 +458,15 @@ fn serve(
     stop: Arc<AtomicBool>,
     markdown: bool,
     index: Arc<OnceLock<crate::md::MdIndex>>,
+    zip: Option<Arc<ZipPack>>,
 ) {
-    if markdown {
-        let _ = index.set(crate::md::MdIndex::build(&root));
+    if markdown && index.get().is_none() {
+        let built = if let Some(zip) = &zip {
+            zip.md_index()
+        } else {
+            crate::md::MdIndex::build(&root)
+        };
+        let _ = index.set(built);
     }
     let md_index = index.get();
     while !stop.load(Ordering::SeqCst) {
@@ -427,10 +475,24 @@ fn serve(
             Ok(None) | Err(_) => continue,
         };
 
+        if let Some(zip) = &zip {
+            if let Some(index) = &md_index {
+                match crate::md::dispatch_in(zip.as_ref(), index, req.url()) {
+                    crate::md::Reply::Html { status, body } => respond_html(req, status, body),
+                    crate::md::Reply::Zip(rel) => zip.respond_rel(req, &rel),
+                    crate::md::Reply::File(_) => respond_status(req, 404, "introuvable"),
+                }
+            } else {
+                zip.respond_url(req);
+            }
+            continue;
+        }
+
         if let Some(index) = &md_index {
             match crate::md::dispatch(&root, index, req.url()) {
                 crate::md::Reply::Html { status, body } => respond_html(req, status, body),
                 crate::md::Reply::File(path) => send_file(req, &root, &path),
+                crate::md::Reply::Zip(_) => respond_status(req, 404, "introuvable"),
             }
             continue;
         }
@@ -444,6 +506,10 @@ fn serve(
         };
         send_file(req, &root, &joined);
     }
+}
+
+fn respond_status(req: tiny_http::Request, status: u16, body: &str) {
+    let _ = req.respond(Response::from_string(body).with_status_code(StatusCode(status)));
 }
 
 fn respond_html(req: tiny_http::Request, status: u16, body: String) {
@@ -641,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn zip_still_extracts_to_a_temp_server() {
+    fn zip_serves_without_extracting() {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
 
@@ -649,16 +715,345 @@ mod tests {
         let zip_path = dir.path().join("cours.zip");
         let file = File::create(&zip_path).unwrap();
         let mut writer = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        writer.start_file("index.html", opts).unwrap();
         writer
-            .start_file("index.html", SimpleFileOptions::default())
+            .write_all(b"from-zip<script>nope()</script>")
             .unwrap();
-        writer.write_all(b"from-zip").unwrap();
+        writer.start_file("native/a.css", opts).unwrap();
+        writer.write_all(b"keep").unwrap();
+        writer.start_file("site/OUVRIR.html", opts).unwrap();
+        writer.write_all(b"wrapped").unwrap();
+        writer.start_file("site/a.css", opts).unwrap();
+        writer.write_all(b"css").unwrap();
+        writer.start_file("__MACOSX/._OUVRIR.html", opts).unwrap();
+        writer.write_all(b"junk").unwrap();
+        writer.finish().unwrap();
+
+        // index.html à la racine gagne : le dossier site/ n’est pas la racine.
+        let server = PackServer::open(&zip_path).unwrap();
+        assert!(server.zip.is_some());
+        assert!(!server.markdown);
+        let (status, body) = http_get(server.port, "/");
+        assert_eq!(status, 200);
+        assert_eq!(body, "from-zip<script>nope()</script>");
+        let (status, body) = http_get(server.port, "/site/OUVRIR.html");
+        assert_eq!(status, 200);
+        assert_eq!(body, "wrapped");
+        let (status, _) = http_get(server.port, "/../cours.zip");
+        assert_eq!(status, 403);
+        server.stop();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|ent| ent.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("cours.zip")]);
+    }
+
+    #[test]
+    fn zip_unwraps_a_single_directory() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("native.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        writer.start_file("__MACOSX/._index.html", opts).unwrap();
+        writer.write_all(b"junk").unwrap();
+        writer.start_file("site/OUVRIR.html", opts).unwrap();
+        writer.write_all(b"wrapped").unwrap();
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("site/a.css", stored).unwrap();
+        writer.write_all(b"css").unwrap();
         writer.finish().unwrap();
 
         let server = PackServer::open(&zip_path).unwrap();
-        let (status, body) = http_get(server.port, "/");
+        assert_eq!(server.entry, "OUVRIR.html");
+        let (status, body) = http_get(server.port, "/OUVRIR.html");
         assert_eq!(status, 200);
-        assert_eq!(body, "from-zip");
+        assert_eq!(body, "wrapped");
+        let (status, body) = http_get(server.port, "/a.css");
+        assert_eq!(status, 200);
+        assert_eq!(body, "css");
+        server.stop();
+    }
+
+    #[test]
+    fn markdown_zip_renders_without_extracting() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("notes.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        writer.start_file("notes/page.md", opts).unwrap();
+        writer.write_all(b"# Page\n\nBonjour").unwrap();
+        writer.finish().unwrap();
+
+        let server = PackServer::open(&zip_path).unwrap();
+        assert!(server.markdown);
+        let (status, body) = http_get(server.port, "/");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("page.md"), "{body}");
+        let (status, body) = http_get(server.port, "/page.md");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("<h1>Page</h1>"), "{body}");
+        assert!(body.contains("Bonjour"), "{body}");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|ent| ent.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("notes.zip")]);
+        server.stop();
+    }
+
+    #[test]
+    fn zip_opens_an_entry_that_only_differs_by_case() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("site.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        writer.start_file("site/Ouvrir.HTML", opts).unwrap();
+        writer.write_all(b"ouvrir").unwrap();
+        writer.start_file("site/photo.JPG", opts).unwrap();
+        writer.write_all(b"pixels").unwrap();
+        writer.start_file("site/img/Photo.JPG", opts).unwrap();
+        writer.write_all(b"nested").unwrap();
+        writer.start_file("__MACOSX/._Ouvrir.HTML", opts).unwrap();
+        writer.write_all(b"junk").unwrap();
+        writer.finish().unwrap();
+
+        let server = PackServer::open(&zip_path).unwrap();
+        assert_eq!(server.entry, "Ouvrir.HTML");
+        for path in ["/Ouvrir.HTML", "/ouvrir.html", "/OUVRIR.html"] {
+            let (status, body) = http_get(server.port, path);
+            assert_eq!(status, 200, "{path} {body}");
+            assert_eq!(body, "ouvrir", "{path}");
+        }
+        for path in ["/photo.jpg", "/photo.JPG"] {
+            let (status, body) = http_get(server.port, path);
+            assert_eq!(status, 200, "{path} {body}");
+            assert_eq!(body, "pixels", "{path}");
+        }
+        let (status, body) = http_get(server.port, "/img/photo.jpg");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "nested");
+        let zip = server.zip.as_ref().unwrap();
+        assert_eq!(
+            zip.locate("/photo.jpg", false, None).as_deref(),
+            Some("photo.JPG")
+        );
+        server.stop();
+    }
+
+    #[test]
+    fn zip_exact_name_wins_when_case_collides() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("both.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        writer.start_file("index.html", opts).unwrap();
+        writer.write_all(b"lower").unwrap();
+        writer.start_file("Index.html", opts).unwrap();
+        writer.write_all(b"mixed").unwrap();
+        writer.finish().unwrap();
+
+        let server = PackServer::open(&zip_path).unwrap();
+        assert_eq!(server.entry, "index.html");
+        let (status, body) = http_get(server.port, "/index.html");
+        assert_eq!((status, body.as_str()), (200, "lower"));
+        let (status, body) = http_get(server.port, "/Index.html");
+        assert_eq!((status, body.as_str()), (200, "mixed"));
+        let (status, body) = http_get(server.port, "/INDEX.HTML");
+        assert_eq!((status, body.as_str()), (200, "lower"));
+        server.stop();
+
+        let tie_path = dir.path().join("tie.zip");
+        let file = File::create(&tie_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer.start_file("INDEX.HTML", opts).unwrap();
+        writer.write_all(b"upper").unwrap();
+        writer.start_file("Index.html", opts).unwrap();
+        writer.write_all(b"mixed").unwrap();
+        writer.finish().unwrap();
+
+        let server = PackServer::open(&tie_path).unwrap();
+        assert_eq!(server.entry, "INDEX.HTML");
+        let (status, body) = http_get(server.port, "/index.html");
+        assert_eq!((status, body.as_str()), (200, "upper"));
+        let (status, body) = http_get(server.port, "/Index.html");
+        assert_eq!((status, body.as_str()), (200, "mixed"));
+        let (status, body) = http_get(server.port, "/INDEX.HTML");
+        assert_eq!((status, body.as_str()), (200, "upper"));
+        server.stop();
+    }
+
+    #[test]
+    fn zip_serves_nfd_names_from_nfc_urls() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let nfd_file = "caf\u{0065}\u{0301}.png";
+        let nfd_dir = "caf\u{0065}\u{0301}/a.png";
+        assert_ne!(nfd_file, "caf\u{00e9}.png");
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("accents.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        writer.start_file("index.html", opts).unwrap();
+        writer.write_all(b"home").unwrap();
+        writer.start_file(nfd_file, opts).unwrap();
+        writer.write_all(b"png").unwrap();
+        writer.start_file(nfd_dir, opts).unwrap();
+        writer.write_all(b"dirpng").unwrap();
+        writer.finish().unwrap();
+
+        let server = PackServer::open(&zip_path).unwrap();
+        for path in ["/caf%C3%A9.png", "/cafe%CC%81.png", "/Caf%C3%A9.png"] {
+            let (status, body) = http_get(server.port, path);
+            assert_eq!(status, 200, "{path} {body}");
+            assert_eq!(body, "png", "{path}");
+        }
+        let (status, body) = http_get(server.port, "/caf%C3%A9/a.png");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "dirpng");
+        server.stop();
+    }
+
+    #[test]
+    fn markdown_zip_lists_an_image_only_folder() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("notes");
+        std::fs::create_dir_all(folder.join("notes")).unwrap();
+        std::fs::create_dir_all(folder.join("figures")).unwrap();
+        std::fs::create_dir_all(folder.join("__MACOSX")).unwrap();
+        std::fs::write(folder.join("notes/page.md"), b"# Page\n\nBonjour").unwrap();
+        std::fs::write(folder.join("figures/a.png"), b"png").unwrap();
+        std::fs::write(folder.join("__MACOSX/._page.md"), b"junk").unwrap();
+
+        let disk = PackServer::open(&folder).unwrap();
+        let (status, disk_body) = http_get(disk.port, "/");
+        assert_eq!(status, 200, "{disk_body}");
+        assert!(disk_body.contains("href=\"/figures/\""), "{disk_body}");
+        assert!(!disk_body.contains("__MACOSX"), "{disk_body}");
+        disk.stop();
+
+        let zip_path = dir.path().join("notes.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        writer.start_file("notes/page.md", opts).unwrap();
+        writer.write_all(b"# Page\n\nBonjour").unwrap();
+        writer.start_file("figures/a.png", opts).unwrap();
+        writer.write_all(b"png").unwrap();
+        writer.start_file("__MACOSX/notes/._page.md", opts).unwrap();
+        writer.write_all(b"junk").unwrap();
+        writer.start_file(".hidden/secret.md", opts).unwrap();
+        writer.write_all(b"# Secret").unwrap();
+        writer.finish().unwrap();
+
+        let server = PackServer::open(&zip_path).unwrap();
+        assert!(server.markdown);
+        let (status, body) = http_get(server.port, "/");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("href=\"/figures/\""), "{body}");
+        assert!(body.contains("href=\"/notes/\""), "{body}");
+        assert!(body.contains("page.md"), "{body}");
+        assert!(!body.contains("__MACOSX"), "{body}");
+        assert!(!body.contains("secret"), "{body}");
+        let (status, body) = http_get(server.port, "/Notes/Page.md");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("<h1>Page</h1>"), "{body}");
+        let (status, body) = http_get(server.port, "/Figures/");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("ne contient pas"), "{body}");
+        let zip = server.zip.as_ref().unwrap();
+        let index = server.index.get().unwrap();
+        assert_eq!(
+            zip.locate("/Notes/Page.md", true, Some(index)).as_deref(),
+            Some("Notes/Page.md")
+        );
+        assert!(zip.load_text("Notes/Page.md").unwrap().contains("# Page"));
+        server.stop();
+    }
+
+    #[test]
+    fn opening_reports_zip_catalog_and_note_index() {
+        use std::io::Write;
+        use std::sync::Mutex;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("notes.zip");
+        let file = File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        writer.start_file("notes/page.md", opts).unwrap();
+        writer.write_all(b"# Page").unwrap();
+        writer.finish().unwrap();
+
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let keep = std::sync::Arc::clone(&seen);
+        let progress = crate::progress::Reporter::new(3, move |event| {
+            keep.lock()
+                .unwrap()
+                .push((event.label, event.ratio, event.detail));
+        });
+        let server = PackServer::open_with(&zip_path, &progress).unwrap();
+        assert!(server.markdown);
+        assert!(server.index.get().is_some());
+        let events = seen.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|(label, ratio, _)| { label == "Lecture du catalogue" && *ratio == Some(1.0) }));
+        assert!(events
+            .iter()
+            .any(|(label, ratio, _)| label == "Index des fichiers" && *ratio == Some(1.0)));
+        assert!(events.iter().any(|(label, ratio, detail)| {
+            label == "Index des notes" && *ratio == Some(1.0) && detail.contains("1 note")
+        }));
+        server.stop();
+    }
+
+    #[test]
+    fn opening_a_markdown_folder_reports_an_indeterminate_count() {
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), b"# A").unwrap();
+        std::fs::write(dir.path().join("b.md"), b"# B").unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let keep = std::sync::Arc::clone(&seen);
+        let progress = crate::progress::Reporter::new(4, move |event| {
+            keep.lock()
+                .unwrap()
+                .push((event.label, event.ratio, event.detail));
+        });
+        let server = PackServer::open_with(dir.path(), &progress).unwrap();
+        assert!(server.markdown);
+        let events = seen.lock().unwrap();
+        assert!(events.iter().any(|(label, ratio, detail)| {
+            label == "Index des notes" && ratio.is_none() && detail.contains("2 notes")
+        }));
         server.stop();
     }
 

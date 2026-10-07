@@ -81,6 +81,8 @@ pub(crate) struct LivePack {
     /// Dernier choix de modèle. Une réponse Ollama tardive ne réécrit pas
     /// un choix commencé après.
     choice_gen: Mutex<u64>,
+    /// Zip servi sans extraction. Les lectures passent par le catalogue.
+    zip: Option<Arc<crate::zip_pack::ZipPack>>,
 }
 
 impl LivePack {
@@ -106,7 +108,12 @@ impl LivePack {
             shown: Mutex::new(None),
             save_dir,
             choice_gen: Mutex::new(0),
+            zip: None,
         }
+    }
+
+    pub(crate) fn attach_zip(&mut self, zip: Arc<crate::zip_pack::ZipPack>) {
+        self.zip = Some(zip);
     }
 
     /// Une archive s’enregistre à côté du fichier, pas dans l’extraction.
@@ -161,7 +168,7 @@ impl LivePack {
             return;
         }
         let path = url.path().to_string();
-        if let Some(rel) = source_of(&self.root, self.markdown, self.index.get(), &path) {
+        if let Some(rel) = self.locate(&path) {
             *lock(&self.last_path) = Some(path);
             *lock(&self.current) = Some(rel);
             return;
@@ -176,7 +183,7 @@ impl LivePack {
     pub(crate) fn resolved_current(&self) -> Option<String> {
         let path = lock(&self.last_path).clone();
         if let Some(path) = path {
-            if let Some(rel) = source_of(&self.root, self.markdown, self.index.get(), &path) {
+            if let Some(rel) = self.locate(&path) {
                 *lock(&self.current) = Some(rel.clone());
                 return Some(rel);
             }
@@ -298,7 +305,7 @@ impl LivePack {
         let rels = pages_to_send(&batch, current.as_deref())?;
         let mut docs = Vec::with_capacity(rels.len());
         for rel in &rels {
-            let text = read_pack_text(&self.root, rel, self.markdown)?;
+            let text = self.document(rel)?;
             docs.push((rel.clone(), text));
         }
         let question = normalize_question(question);
@@ -468,6 +475,26 @@ pub(crate) fn is_pack_origin(url: &tauri::Url, port: u16) -> bool {
     url.scheme() == "http"
         && url.host_str() == Some("127.0.0.1")
         && url.port_or_known_default() == Some(port)
+}
+
+impl LivePack {
+    fn locate(&self, url_path: &str) -> Option<String> {
+        if let Some(zip) = &self.zip {
+            return zip.locate(url_path, self.markdown, self.index.get());
+        }
+        source_of(&self.root, self.markdown, self.index.get(), url_path)
+    }
+
+    pub(crate) fn document(&self, rel: &str) -> Result<String, String> {
+        if let Some(zip) = &self.zip {
+            let text = zip.load_text(rel)?;
+            if self.markdown {
+                return Ok(text);
+            }
+            return Ok(strip_script_and_style(&text));
+        }
+        read_pack_text(&self.root, rel, self.markdown)
+    }
 }
 
 pub(crate) fn source_of(
@@ -1906,5 +1933,38 @@ mod tests {
         folder_pack.point_save_at(folder.path());
         assert_eq!(folder_pack.save_directory(), folder.path());
         assert!(!folder_pack.save_lands_in_temp(&folder.path().join("reponse.md")));
+    }
+
+    #[test]
+    fn zip_page_is_read_from_the_archive() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("cours.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file("index.html", SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(b"<p>Bonjour le texte.</p><script>nope()</script>")
+            .unwrap();
+        writer.finish().unwrap();
+
+        let mut pack = LivePack::new(zip_path.clone(), false, 9, Arc::new(OnceLock::new()));
+        pack.point_save_at(&zip_path);
+        pack.attach_zip(Arc::new(crate::zip_pack::ZipPack::open(&zip_path).unwrap()));
+        pack.note(&"http://127.0.0.1:9/index.html".parse().unwrap());
+        assert_eq!(pack.resolved_current().as_deref(), Some("index.html"));
+        let text = pack.document("index.html").unwrap();
+        assert!(text.contains("Bonjour le texte."), "{text}");
+        assert!(!text.contains("nope"), "{text}");
+        assert_eq!(pack.save_directory(), dir.path());
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|ent| ent.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("cours.zip")]);
     }
 }
