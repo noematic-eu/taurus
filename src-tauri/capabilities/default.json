@@ -5,6 +5,9 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "dialog:default"
+    "dialog:default",
+    "allow-pick-pack",
+    "allow-pick-folder",
+    "allow-open-pack-path"
   ]
 }

@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "ask-view",
+  "description": "Fenêtre Interroger : commandes du lot et d’Ollama, rien d’autre.",
+  "windows": ["ask-*"],
+  "permissions": [
+    "allow-ask-state",
+    "allow-ask-add",
+    "allow-ask-remove",
+    "allow-ask-question",
+    "allow-ask-models",
+    "allow-ask-set-model",
+    "allow-ask-save",
+    "allow-ask-open",
+    "allow-ask-rendered"
+  ]
+}

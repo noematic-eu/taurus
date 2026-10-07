@@ -44,8 +44,13 @@ pub(crate) struct MdIndex {
 }
 
 pub(crate) enum Reply {
-    Html { status: u16, body: String },
+    Html {
+        status: u16,
+        body: String,
+    },
     File(PathBuf),
+    /// Chemin relatif servi depuis un zip, sans extraction.
+    Zip(String),
 }
 
 pub(crate) fn contains_markdown(dir: &Path) -> bool {
@@ -165,28 +170,109 @@ enum Child {
 
 impl MdIndex {
     pub(crate) fn build(root: &Path) -> Self {
+        Self::build_with(root, &mut |_| {})
+    }
+
+    /// Comme [`build`](Self::build). `bump` reçoit le nombre de notes déjà vues.
+    pub(crate) fn build_with(root: &Path, bump: &mut dyn FnMut(u64)) -> Self {
         let mut index = Self {
             docs: Vec::new(),
             pages: HashMap::new(),
             subdirs: Vec::new(),
             dup_names: HashSet::new(),
         };
+        let mut notes = 0u64;
         if let Ok(root_canon) = root.canonicalize() {
             let mut seen = HashSet::new();
             seen.insert(root_canon.clone());
-            index.walk(&root_canon, &root_canon, "", &mut seen);
+            index.walk(&root_canon, &root_canon, "", &mut seen, &mut notes, bump);
         }
-        index.docs.sort_by(|a, b| {
+        bump(notes);
+        index.finish()
+    }
+
+    /// Index construit depuis des chemins déjà connus, sans lire les fichiers.
+    pub(crate) fn from_rels(rels: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        Self::from_rels_with(rels, None, &mut |_, _| {})
+    }
+
+    /// `bump(vus, notes)` pendant le parcours. `total` est le nombre de chemins attendus.
+    pub(crate) fn from_rels_with(
+        rels: impl IntoIterator<Item = impl AsRef<str>>,
+        total: Option<u64>,
+        bump: &mut dyn FnMut(u64, u64),
+    ) -> Self {
+        let mut index = Self {
+            docs: Vec::new(),
+            pages: HashMap::new(),
+            subdirs: Vec::new(),
+            dup_names: HashSet::new(),
+        };
+        let mut subdirs = HashSet::new();
+        let mut seen = 0u64;
+        let mut notes = 0u64;
+        for rel in rels {
+            seen += 1;
+            let rel = rel.as_ref();
+            if !rel.split('/').any(skip) {
+                if let Some(name) = Path::new(rel).file_name().and_then(|n| n.to_str()) {
+                    if is_md(name) {
+                        if let Some((dir, _)) = rel.split_once('/') {
+                            if !dir.is_empty() {
+                                subdirs.insert(dir.to_string());
+                            }
+                        }
+                        index.add_md(name, rel.to_string());
+                        notes += 1;
+                    }
+                }
+            }
+            if seen % 1024 == 0 || total.is_some_and(|total| seen >= total) {
+                bump(seen, notes);
+            }
+        }
+        bump(seen, notes);
+        index.subdirs = subdirs.into_iter().collect();
+        index.finish()
+    }
+
+    /// Ajoute des dossiers de premier niveau qui ne contiennent aucune note.
+    pub(crate) fn include_top_dirs<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for name in names {
+            let name = name.as_ref();
+            if name.is_empty() || name.contains('/') || self.subdirs.iter().any(|have| have == name)
+            {
+                continue;
+            }
+            self.subdirs.push(name.to_string());
+        }
+        self.subdirs.sort();
+    }
+
+    fn finish(mut self) -> Self {
+        self.docs.sort_by(|a, b| {
             a.name_lower
                 .cmp(&b.name_lower)
                 .then_with(|| a.rel.cmp(&b.rel))
         });
-        index.subdirs.sort();
-        index.dup_names = duplicate_basenames(&index.docs);
-        index
+        self.subdirs.sort();
+        self.dup_names = duplicate_basenames(&self.docs);
+        self
     }
 
-    fn walk(&mut self, root: &Path, dir: &Path, prefix: &str, seen: &mut HashSet<PathBuf>) {
+    fn walk(
+        &mut self,
+        root: &Path,
+        dir: &Path,
+        prefix: &str,
+        seen: &mut HashSet<PathBuf>,
+        notes: &mut u64,
+        bump: &mut dyn FnMut(u64),
+    ) {
         let Ok(rd) = fs::read_dir(dir) else {
             return;
         };
@@ -209,9 +295,13 @@ impl MdIndex {
                     if prefix.is_empty() {
                         self.subdirs.push(name.to_string());
                     }
-                    self.walk(root, &child, &rel, seen);
+                    self.walk(root, &child, &rel, seen, notes, bump);
                 }
-                Child::File if is_md(&name) => self.add_md(&name, rel),
+                Child::File if is_md(&name) => {
+                    self.add_md(&name, rel);
+                    *notes += 1;
+                    bump(*notes);
+                }
                 Child::File | Child::Skip => {}
             }
         }
@@ -243,7 +333,136 @@ impl MdIndex {
     }
 }
 
+/// Arborescence servie : un dossier sur disque, ou un zip lu sans extraction.
+pub(crate) trait Store {
+    fn label(&self) -> String;
+    fn is_file(&self, rel: &str) -> bool;
+    fn is_dir(&self, rel: &str) -> bool;
+    fn read_text(&self, rel: &str) -> String;
+    fn list(&self, rel: &str) -> (Vec<String>, Vec<String>);
+    fn open_file(&self, rel: &str) -> Reply;
+}
+
+struct Disk<'a> {
+    root: &'a Path,
+}
+
+impl Store for Disk<'_> {
+    fn label(&self) -> String {
+        self.root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Markdown".into())
+    }
+
+    fn is_file(&self, rel: &str) -> bool {
+        under_root(self.root, &self.root.join(rel)).is_some_and(|path| path.is_file())
+    }
+
+    fn is_dir(&self, rel: &str) -> bool {
+        directory_inside(self.root, &self.root.join(rel))
+    }
+
+    fn read_text(&self, rel: &str) -> String {
+        let Some(path) = under_root(self.root, &self.root.join(rel)) else {
+            return String::new();
+        };
+        fs::read_to_string(path).unwrap_or_default()
+    }
+
+    fn list(&self, rel: &str) -> (Vec<String>, Vec<String>) {
+        let dir = self.root.join(rel);
+        let root_canon = self.root.canonicalize().ok();
+        let here = dir.canonicalize().ok();
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        let Ok(rd) = fs::read_dir(&dir) else {
+            return (dirs, files);
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy().into_owned();
+            if skip(&name) {
+                continue;
+            }
+            let Ok(ft) = ent.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                let Some(root_canon) = root_canon.as_ref() else {
+                    continue;
+                };
+                let Ok(canon) = ent.path().canonicalize() else {
+                    continue;
+                };
+                if !canon.starts_with(root_canon) || here.as_ref().is_some_and(|h| &canon == h) {
+                    continue;
+                }
+                if canon.is_dir() {
+                    dirs.push(name);
+                } else if is_md(&name) {
+                    files.push(name);
+                }
+            } else if ft.is_dir() {
+                dirs.push(name);
+            } else if is_md(&name) {
+                files.push(name);
+            }
+        }
+        (dirs, files)
+    }
+
+    fn open_file(&self, rel: &str) -> Reply {
+        match under_root(self.root, &self.root.join(rel)) {
+            Some(path) => Reply::File(path),
+            None => html(403, shell("Interdit", "<p>Chemin refusé.</p>")),
+        }
+    }
+}
+
+/// Fichier `.md` source d’une URL du lecteur. L’accueil, une recherche et un
+/// dossier n’ont pas de fichier. `/page/Slug` renvoie le `.md` choisi par l’index.
+pub(crate) fn markdown_source(root: &Path, index: &MdIndex, url_path: &str) -> Option<String> {
+    markdown_source_in(&Disk { root }, index, url_path)
+}
+
+pub(crate) fn markdown_source_in(
+    store: &dyn Store,
+    index: &MdIndex,
+    url_path: &str,
+) -> Option<String> {
+    let url_path = url_path.split(['?', '#']).next().unwrap_or(url_path);
+    let path = percent_decode(url_path);
+    let rel = path.trim_start_matches('/').trim_end_matches('/');
+    if !rel.is_empty()
+        && rel
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    if rel.is_empty() || rel == "index.html" || rel == "index.htm" {
+        return None;
+    }
+    if let Some(slug) = rel.strip_prefix("page/") {
+        let file_rel = index.page(slug)?;
+        return store.is_file(file_rel).then(|| file_rel.to_string());
+    }
+    let name = Path::new(rel)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if !is_md(name) {
+        return None;
+    }
+    store.is_file(rel).then(|| rel.to_string())
+}
+
 pub(crate) fn dispatch(root: &Path, index: &MdIndex, url: &str) -> Reply {
+    dispatch_in(&Disk { root }, index, url)
+}
+
+pub(crate) fn dispatch_in(store: &dyn Store, index: &MdIndex, url: &str) -> Reply {
     let (url_path, query) = match url.split_once('?') {
         Some((path, query)) => (path, Some(query)),
         None => (url, None),
@@ -260,17 +479,14 @@ pub(crate) fn dispatch(root: &Path, index: &MdIndex, url: &str) -> Reply {
 
     let q = query.and_then(|q| query_value(q, "q"));
     if rel.is_empty() || rel == "index.html" {
-        let folder = root
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Markdown".into());
+        let folder = store.label();
         return html(200, home_html(&folder, index, q.as_deref().unwrap_or("")));
     }
 
     if let Some(slug) = rel.strip_prefix("page/") {
         let slug = percent_decode(slug);
         if let Some(rel) = index.page(&slug) {
-            return article(root, rel, index);
+            return article(store, rel, index);
         }
         let key = normalize_slug(&slug);
         let search = if key.is_empty() { slug.as_str() } else { &key };
@@ -287,18 +503,19 @@ pub(crate) fn dispatch(root: &Path, index: &MdIndex, url: &str) -> Reply {
         );
     }
 
-    let candidate = root.join(rel);
-    if directory_inside(root, &candidate) {
-        return html(200, dir_html(root, rel));
+    if store.is_dir(rel) {
+        let (dirs, files) = store.list(rel);
+        return html(200, dir_html(rel, dirs, files));
     }
-    if candidate.is_file() {
-        if is_md(candidate.file_name().and_then(|n| n.to_str()).unwrap_or("")) {
-            return article(root, rel, index);
+    if store.is_file(rel) {
+        let name = Path::new(rel)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if is_md(name) {
+            return article(store, rel, index);
         }
-        return match under_root(root, &candidate) {
-            Some(path) => Reply::File(path),
-            None => html(403, shell("Interdit", "<p>Chemin refusé.</p>")),
-        };
+        return store.open_file(rel);
     }
     html(
         404,
@@ -309,11 +526,8 @@ pub(crate) fn dispatch(root: &Path, index: &MdIndex, url: &str) -> Reply {
     )
 }
 
-fn article(root: &Path, rel: &str, index: &MdIndex) -> Reply {
-    let Some(path) = under_root(root, &root.join(rel)) else {
-        return html(404, shell("Introuvable", "<p>Introuvable.</p>"));
-    };
-    let md = fs::read_to_string(&path).unwrap_or_default();
+fn article(store: &dyn Store, rel: &str, index: &MdIndex) -> Reply {
+    let md = store.read_text(rel);
     let fallback = Path::new(rel)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -418,44 +632,7 @@ fn home_html(folder: &str, index: &MdIndex, query: &str) -> String {
     shell(folder, &body)
 }
 
-fn dir_html(root: &Path, rel: &str) -> String {
-    let dir = root.join(rel);
-    let root_canon = root.canonicalize().ok();
-    let here = dir.canonicalize().ok();
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-    if let Ok(rd) = fs::read_dir(&dir) {
-        for ent in rd.flatten() {
-            let name = ent.file_name();
-            let name = name.to_string_lossy().into_owned();
-            if skip(&name) {
-                continue;
-            }
-            let Ok(ft) = ent.file_type() else {
-                continue;
-            };
-            if ft.is_symlink() {
-                let Some(root_canon) = root_canon.as_ref() else {
-                    continue;
-                };
-                let Ok(canon) = ent.path().canonicalize() else {
-                    continue;
-                };
-                if !canon.starts_with(root_canon) || here.as_ref().is_some_and(|h| &canon == h) {
-                    continue;
-                }
-                if canon.is_dir() {
-                    dirs.push(name);
-                } else if is_md(&name) {
-                    files.push(name);
-                }
-            } else if ft.is_dir() {
-                dirs.push(name);
-            } else if is_md(&name) {
-                files.push(name);
-            }
-        }
-    }
+fn dir_html(rel: &str, mut dirs: Vec<String>, mut files: Vec<String>) -> String {
     dirs.sort();
     files.sort();
     let extra = files.len().saturating_sub(LIST_LIMIT);
@@ -723,7 +900,7 @@ fn directory_inside(root: &Path, candidate: &Path) -> bool {
     canon.is_dir() && canon.starts_with(&root)
 }
 
-fn under_root(root: &Path, candidate: &Path) -> Option<PathBuf> {
+pub(crate) fn under_root(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     let path = candidate.canonicalize().ok()?;
     if path.starts_with(&root) {
@@ -811,7 +988,7 @@ fn encode_component(s: &str) -> String {
     out
 }
 
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -869,6 +1046,18 @@ mod tests {
         fs::write(nested.join("Zinc_grokipedia.md"), b"# Zinc\n").unwrap();
         let index = MdIndex::build(dir.path());
         (dir, index)
+    }
+
+    #[test]
+    fn build_reports_the_note_count() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), b"# A").unwrap();
+        fs::write(dir.path().join("b.txt"), b"pas une note").unwrap();
+        fs::write(dir.path().join("c.md"), b"# C").unwrap();
+        let mut counts = Vec::new();
+        let index = MdIndex::build_with(dir.path(), &mut |n| counts.push(n));
+        assert_eq!(index.docs.len(), 2);
+        assert_eq!(counts.last().copied(), Some(2));
     }
 
     #[test]
