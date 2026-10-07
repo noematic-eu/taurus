@@ -2,7 +2,7 @@
 name = "taurus"
 version = "0.2.0"
 authors = ["Baptiste Boussemart"]
-description = "Lecteur de packs web (dossier, zip, wacz) — SysML, POO, Native, Manning…"
+description = "Lecteur de packs web (dossier, zip, wacz) et de corpus sqlite — SysML, POO, Native, Manning, droit français"
 license = "MIT"
 edition = "2021"
 
@@ -30,6 +30,7 @@ tauri-plugin-dialog = "2.7.2"
 flate2 = "1"
 pulldown-cmark = "0.13.0"
 unicode-normalization = "0.1"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.0"

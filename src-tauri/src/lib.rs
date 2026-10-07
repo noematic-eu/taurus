@@ -1,4 +1,5 @@
 mod ask;
+mod droit;
 mod md;
 mod pack;
 mod progress;
@@ -112,6 +113,9 @@ fn present_pack(
     if let Some(zip) = &server.zip {
         live.attach_zip(Arc::clone(zip));
     }
+    if let Some(droit) = &server.droit {
+        live.attach_droit(Arc::clone(droit));
+    }
     let live = Arc::new(live);
     app.state::<ask::AskStore>().insert(id, live.clone());
 
@@ -186,7 +190,10 @@ fn present_pack(
 fn pick_pack(app: tauri::AppHandle) {
     app.dialog()
         .file()
-        .add_filter("Packs (zip, wacz)", &["zip", "wacz", "warc", "gz"])
+        .add_filter(
+            "Packs (zip, wacz, sqlite)",
+            &["zip", "wacz", "warc", "gz", "sqlite"],
+        )
         .pick_file(move |file| {
             let Some(path) = file else {
                 return;
@@ -360,7 +367,7 @@ fn drop_packs(app: &tauri::AppHandle, paths: &[PathBuf]) {
             let _ = app.emit(
                 "taurus-error",
                 format!(
-                    "{} n’est pas un dossier de site, un .zip, un .wacz ni un .warc",
+                    "{} n’est pas un dossier de site, un .zip, un .wacz, un .warc ni un .sqlite",
                     p.display()
                 ),
             );

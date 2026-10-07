@@ -38,6 +38,12 @@
         "role": "Viewer"
       },
       {
+        "ext": ["sqlite"],
+        "name": "French law corpus",
+        "mimeType": "application/vnd.sqlite3",
+        "role": "Viewer"
+      },
+      {
         "ext": ["wacz"],
         "name": "WACZ web archive",
         "role": "Viewer"

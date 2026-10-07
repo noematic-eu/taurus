@@ -43,6 +43,8 @@ A folder that already has an entry page is served as itself, even if a `.zip` or
 
 A pack is a folder of a static website, a zip of that website, a [WACZ](https://specs.webrecorder.net/wacz/latest/) (ISO WARC inside a zip), or a folder of Markdown notes. CloudFront figure URLs in Manning liveBooks are rewritten to local `figures/` files so the book works offline. A Markdown folder (no entry page) opens as a reader: search by file name, each note rendered to HTML. Links written as `/page/Slug` open the local `Slug_grokipedia.md`, or `Slug_wikipedia.md` if that is the only copy. Markdown files sitting inside an HTML site are still served as text.
 
+A `.sqlite` file of this French-law corpus opens as a reader. The pages come from the database. Taurus does not decompress the file, does not export it, and does not open the raw `.tar.gz` archives. Full-text search ignores accents. Interroger cites the article, for example « Code civil, art. 1240, en vigueur depuis le 2016-10-01 ». Open the `.sqlite` file itself: a folder that only contains it is not this pack.
+
 ```text
 course.zip
 ├── OUVRIR.html      # or index.html
@@ -163,6 +165,8 @@ Un dossier qui a déjà une page d’entrée est servi tel quel, même s’il co
 ### Format d’un pack
 
 Un pack est un dossier de site statique, un zip de ce site, une archive [WACZ](https://specs.webrecorder.net/wacz/latest/) (WARC ISO dans un zip), ou un dossier de notes Markdown. Les URL CloudFront des figures Manning sont réécrits vers `figures/` pour la lecture hors-ligne. Un dossier Markdown (sans page d’entrée) s’ouvre comme un lecteur : recherche sur le nom du fichier, chaque note rendue en HTML. Les liens `/page/Slug` ouvrent le fichier local `Slug_grokipedia.md`, ou `Slug_wikipedia.md` s’il n’y a que celui-là. Les fichiers Markdown à l’intérieur d’un site HTML restent servis comme du texte.
+
+Un fichier `.sqlite` de ce corpus de droit français s’ouvre comme un lecteur. Les pages viennent de la base. Taurus ne décompresse pas le fichier, ne l’exporte pas, et n’ouvre pas les archives `.tar.gz` brutes. La recherche plein texte ignore les accents. Interroger cite l’article, par exemple « Code civil, art. 1240, en vigueur depuis le 2016-10-01 ». Il faut ouvrir le fichier `.sqlite` lui-même : un dossier qui le contient seulement n’est pas ce pack.
 
 ```text
 cours.zip
