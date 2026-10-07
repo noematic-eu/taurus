@@ -401,3 +401,18 @@ h1 {
   max-width: 42rem;
   padding-top: 2rem;
 }
+
+.ko { color: var(--ko); }
+
+.report .verdict {
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-weight: 650;
+  margin: 0 0 0.35rem;
+}
+
+.report .verdict.ok { color: var(--teal); }
+.report .verdict.ko { color: var(--ko); }
+
+.report .href { color: var(--muted); }
+
+.report section { margin-top: 0.85rem; }

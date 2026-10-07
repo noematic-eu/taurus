@@ -108,6 +108,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     invoke("pick_pack").catch((e) => showError(String(e)));
   });
 
+  document.querySelector("#check").addEventListener("click", () => {
+    invoke("pick_link_check").catch((e) => showError(String(e)));
+  });
+
   await listen("taurus-error", (ev) => {
     showError(String(ev.payload));
   });

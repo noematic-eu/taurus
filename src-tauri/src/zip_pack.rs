@@ -17,8 +17,8 @@ use crate::md::{MdIndex, Reply, Store};
 use crate::progress::{self, Reporter};
 
 const ENTRY_NAMES: &[&str] = &["OUVRIR.html", "ouvrir.html", "index.html", "index.htm"];
-/// Plafond d’une lecture en mémoire (Markdown, Interroger). Le HTTP, lui, streame.
-const TEXT_LIMIT: u64 = 16 * 1024 * 1024;
+/// Plafond d’une lecture en mémoire (Markdown, Interroger, rapport de liens). Le HTTP, lui, streame.
+pub(crate) const TEXT_LIMIT: u64 = 16 * 1024 * 1024;
 
 trait ReadSeek: Read + Seek + Send {}
 impl<T: Read + Seek + Send> ReadSeek for T {}
@@ -248,7 +248,30 @@ impl ZipPack {
         lookup_folded(rel, |name| self.dirs.contains(name), &self.dir_alias)
     }
 
+    pub(crate) fn lookup_file(&self, rel: &str) -> Option<String> {
+        self.stored_file(rel)
+    }
+
+    pub(crate) fn lookup_dir(&self, rel: &str) -> Option<String> {
+        self.stored_dir(rel)
+    }
+
+    pub(crate) fn file_count(&self) -> u64 {
+        self.files.len() as u64
+    }
+
     fn read_limited(&self, rel: &str) -> Result<Vec<u8>, String> {
+        Ok(self.read_bytes(rel)?.0)
+    }
+
+    /// Lit au plus `TEXT_LIMIT`. `truncated` est vrai quand le fichier décompressé
+    /// dépasse ce plafond : le parcours de liens ne doit pas conclure sur une page coupée.
+    pub(crate) fn read_capped(&self, rel: &str) -> Result<(String, bool), String> {
+        let (buf, truncated) = self.read_bytes(rel)?;
+        Ok((String::from_utf8_lossy(&buf).into_owned(), truncated))
+    }
+
+    fn read_bytes(&self, rel: &str) -> Result<(Vec<u8>, bool), String> {
         let rel = self
             .stored_file(rel)
             .ok_or_else(|| format!("Impossible de lire {rel}."))?;
@@ -261,13 +284,14 @@ impl ZipPack {
         let mut file = archive
             .by_index(index)
             .map_err(|_| format!("Impossible de lire {rel}."))?;
+        let truncated = file.size() > TEXT_LIMIT;
         let cap = usize::try_from(file.size().min(TEXT_LIMIT)).unwrap_or(0);
         let mut buf = Vec::with_capacity(cap);
         (&mut file)
             .take(TEXT_LIMIT)
             .read_to_end(&mut buf)
             .map_err(|_| format!("Impossible de lire {rel}."))?;
-        Ok(buf)
+        Ok((buf, truncated))
     }
 }
 
@@ -379,13 +403,13 @@ fn immediate<'a>(prefix: &str, rel: &'a str) -> Option<(&'a str, bool)> {
 
 /// NFC puis minuscules ASCII. Deux noms qui ne diffèrent que par là désignent
 /// le même fichier, comme après extraction sur APFS.
-fn fold_key(name: &str) -> String {
+pub(crate) fn fold_key(name: &str) -> String {
     name.nfc().collect::<String>().to_ascii_lowercase()
 }
 
 /// Ne garde un alias que lorsque le nom stocké n’est pas déjà sa forme pliée.
 /// En cas de collision, la forme pliée exacte gagne, sinon le nom le plus petit.
-fn fold_index<'a>(names: impl Iterator<Item = &'a str>) -> HashMap<String, String> {
+pub(crate) fn fold_index<'a>(names: impl Iterator<Item = &'a str>) -> HashMap<String, String> {
     let mut map: HashMap<String, String> = HashMap::new();
     for name in names {
         let key = fold_key(name);
@@ -407,7 +431,7 @@ fn fold_index<'a>(names: impl Iterator<Item = &'a str>) -> HashMap<String, Strin
     map
 }
 
-fn lookup_folded(
+pub(crate) fn lookup_folded(
     rel: &str,
     exact: impl Fn(&str) -> bool,
     alias: &HashMap<String, String>,

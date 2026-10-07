@@ -1,4 +1,5 @@
 mod ask;
+mod audit;
 mod md;
 mod pack;
 mod progress;
@@ -85,6 +86,60 @@ fn begin_open(app: &tauri::AppHandle, pack_path: PathBuf) {
         });
     if spawned.is_err() {
         let _ = app.emit("taurus-error", "Ouverture interrompue.");
+    }
+}
+
+/// Parcourt une archive hors du thread principal. La barre d’accueil est la même
+/// que pour une ouverture.
+fn begin_link_check(app: &tauri::AppHandle, pack_path: PathBuf) {
+    let app = app.clone();
+    let gen = OPEN_GEN.fetch_add(1, Ordering::SeqCst);
+    let link_gen = app.state::<audit::ReportStore>().begin();
+    let worker = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("taurus-links".into())
+        .spawn(move || {
+            let emit = worker.clone();
+            let progress = progress::Reporter::new(gen, move |event| {
+                let _ = emit.emit("taurus-progress", event);
+            });
+            let name = pack_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "archive".to_string());
+            progress.force("Vérification des liens", None, name.clone());
+            let opened = audit::check_archive(&pack_path, &progress);
+            let present = worker.clone();
+            if worker
+                .run_on_main_thread(move || {
+                    match opened {
+                        Ok(report) => {
+                            let html = audit::render(&report, &name);
+                            if present
+                                .state::<audit::ReportStore>()
+                                .publish(link_gen, html)
+                            {
+                                if let Err(err) = open_report_window(&present) {
+                                    let _ = present.emit("taurus-error", err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if present.state::<audit::ReportStore>().is_current(link_gen) {
+                                let _ = present.emit("taurus-error", err);
+                            }
+                        }
+                    }
+                    let _ = present.emit("taurus-progress", progress::OpenProgress::finished(gen));
+                })
+                .is_err()
+            {
+                let _ = worker.emit("taurus-error", "Vérification interrompue.");
+                let _ = worker.emit("taurus-progress", progress::OpenProgress::finished(gen));
+            }
+        });
+    if spawned.is_err() {
+        let _ = app.emit("taurus-error", "Vérification interrompue.");
     }
 }
 
@@ -215,6 +270,25 @@ fn open_pack_path(app: tauri::AppHandle, path: String) {
 }
 
 #[tauri::command]
+fn pick_link_check(app: tauri::AppHandle) {
+    app.dialog()
+        .file()
+        .set_title("Vérifier les liens d’une archive")
+        .add_filter("Archives (zip, wacz)", &["zip", "wacz", "warc", "gz"])
+        .pick_file(move |file| {
+            let Some(path) = file else {
+                return;
+            };
+            begin_link_check(&app, PathBuf::from(path.to_string()));
+        });
+}
+
+#[tauri::command]
+fn link_report(app: tauri::AppHandle) -> Result<String, String> {
+    app.state::<audit::ReportStore>().get()
+}
+
+#[tauri::command]
 fn ask_state(app: tauri::AppHandle, id: u64) -> Result<ask::AskView, String> {
     Ok(app.state::<ask::AskStore>().get(id)?.view())
 }
@@ -334,6 +408,24 @@ fn open_reply_window(app: &tauri::AppHandle, label: &str, title: String) -> Resu
     Ok(())
 }
 
+fn open_report_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let label = "link-report";
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.eval("location.reload()");
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(app, label, WebviewUrl::App("report.html".into()))
+        .title("Rapport de parcours")
+        .inner_size(860.0, 920.0)
+        .build()
+        .map_err(|err| format!("fenêtre: {err}"))?;
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn ask_rendered(app: tauri::AppHandle, id: u64) -> Result<ask::AnswerPage, String> {
     app.state::<ask::AskStore>().get(id)?.answer_page()
@@ -380,6 +472,8 @@ pub fn run() {
             pick_pack,
             pick_folder,
             open_pack_path,
+            pick_link_check,
+            link_report,
             ask_state,
             ask_add,
             ask_remove,
@@ -392,6 +486,7 @@ pub fn run() {
         ])
         .setup(|app| {
             app.manage(ask::AskStore::default());
+            app.manage(audit::ReportStore::default());
             let handle = app.handle().clone();
             if let Some(main) = app.get_webview_window("main") {
                 main.on_window_event(move |event| {

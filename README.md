@@ -43,6 +43,8 @@ A folder that already has an entry page is served as itself, even if a `.zip` or
 
 A pack is a folder of a static website, a zip of that website, a [WACZ](https://specs.webrecorder.net/wacz/latest/) (ISO WARC inside a zip), or a folder of Markdown notes. CloudFront figure URLs in Manning liveBooks are rewritten to local `figures/` files so the book works offline. A Markdown folder (no entry page) opens as a reader: search by file name, each note rendered to HTML. Links written as `/page/Slug` open the local `Slug_grokipedia.md`, or `Slug_wikipedia.md` if that is the only copy. Markdown files sitting inside an HTML site are still served as text.
 
+The home window can also check a zip, a WACZ, or a WARC for broken links. Taurus walks the pages the reader would serve and reports a missing file, a path that leaves the archive, or a missing anchor. External addresses are counted and not opened. An address that appears only in a script is not a link. A Markdown zip is refused, because it is a notebook rather than an HTML site. Only the HTML and CSS that the walk reaches are read; the rest of a zip stays packed.
+
 ```text
 course.zip
 ├── OUVRIR.html      # or index.html
@@ -163,6 +165,8 @@ Un dossier qui a déjà une page d’entrée est servi tel quel, même s’il co
 ### Format d’un pack
 
 Un pack est un dossier de site statique, un zip de ce site, une archive [WACZ](https://specs.webrecorder.net/wacz/latest/) (WARC ISO dans un zip), ou un dossier de notes Markdown. Les URL CloudFront des figures Manning sont réécrits vers `figures/` pour la lecture hors-ligne. Un dossier Markdown (sans page d’entrée) s’ouvre comme un lecteur : recherche sur le nom du fichier, chaque note rendue en HTML. Les liens `/page/Slug` ouvrent le fichier local `Slug_grokipedia.md`, ou `Slug_wikipedia.md` s’il n’y a que celui-là. Les fichiers Markdown à l’intérieur d’un site HTML restent servis comme du texte.
+
+L’accueil peut aussi vérifier les liens d’un zip, d’un WACZ ou d’un WARC. Taurus parcourt les pages que le lecteur servirait et signale un fichier absent, un chemin qui sort de l’archive, ou une ancre absente. Les adresses externes sont comptées et ne sont pas ouvertes. Une adresse écrite seulement dans un script n’est pas un lien. Un zip de notes Markdown est refusé : ce n’est pas un site HTML. Seuls le HTML et le CSS atteints par le parcours sont lus ; le reste d’un zip n’est pas décompressé.
 
 ```text
 cours.zip

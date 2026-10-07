@@ -13,6 +13,8 @@ fn main() {
             "ask_save",
             "ask_open",
             "ask_rendered",
+            "pick_link_check",
+            "link_report",
         ]),
     ))
     .expect("erreur du script de build Tauri");
