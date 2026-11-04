@@ -96,10 +96,10 @@ impl ZipPack {
                     progress::count_span(done, total),
                 );
             }
-            let Some(name) = archive.name_for_index(index) else {
+            let Ok(Some(name)) = archive.name_for_index(index).transpose() else {
                 continue;
             };
-            let Some((rel, is_dir)) = normalize(name) else {
+            let Some((rel, is_dir)) = normalize(&name) else {
                 continue;
             };
             if is_dir {
