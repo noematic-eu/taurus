@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "link-report",
+  "description": "Fenêtre du rapport de parcours : lire le rapport, rien d’autre.",
+  "windows": ["link-report"],
+  "permissions": ["allow-link-report"]
+}

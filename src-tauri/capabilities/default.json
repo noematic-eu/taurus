@@ -8,6 +8,7 @@
     "dialog:default",
     "allow-pick-pack",
     "allow-pick-folder",
-    "allow-open-pack-path"
+    "allow-open-pack-path",
+    "allow-pick-link-check"
   ]
 }
